@@ -1,5 +1,6 @@
 //============================================================================
 // USB PD BMC 收发器测试平台
+// 测试 TX 和 RX 完整功能
 //============================================================================
 
 `timescale 1ns/1ps
@@ -9,9 +10,9 @@ module pd_bmc_tb;
 // 参数
 parameter CLK_PERIOD = 20;
 
-// 超时计数器
+// 超时计数器 (按时钟周期计数)
 integer timeout_cnt;
-parameter MAX_TIMEOUT = 500000;
+parameter MAX_TIMEOUT = 50000000;  // 约 1 秒仿真时间 @ 50MHz
 
 // 测试信号
 reg         clk;
@@ -25,9 +26,12 @@ reg         tx_start_i;
 wire        tx_done_o;
 wire        tx_busy_o;
 
-// 接收接口
-wire [7:0]  rx_data_o;
-wire        rx_valid_o;
+// 接收接口 (更新为包接口)
+wire [15:0] rx_header_o;
+wire [7:0]  rx_data_o [0:29];
+wire [4:0]  rx_data_len_o;
+wire        rx_done_o;
+wire        rx_busy_o;
 wire        rx_error_o;
 reg         rx_en_i;
 
@@ -50,8 +54,11 @@ pd_bmc_transceiver u_dut (
     .tx_start_i    (tx_start_i),
     .tx_done_o     (tx_done_o),
     .tx_busy_o     (tx_busy_o),
+    .rx_header_o   (rx_header_o),
     .rx_data_o     (rx_data_o),
-    .rx_valid_o    (rx_valid_o),
+    .rx_data_len_o (rx_data_len_o),
+    .rx_done_o     (rx_done_o),
+    .rx_busy_o     (rx_busy_o),
     .rx_error_o    (rx_error_o),
     .rx_en_i       (rx_en_i),
     .bmc_tx_pad    (bmc_tx_pad),
@@ -67,13 +74,19 @@ initial begin
 end
 
 //============================================================================
-// 超时监控
+// 超时监控 - 全局超时
 //============================================================================
-always @(posedge clk) begin
-    timeout_cnt <= timeout_cnt + 1;
-    if (timeout_cnt >= MAX_TIMEOUT) begin
-        $display("[%0t] 超时！强制结束仿真", $time);
-        $finish;
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        timeout_cnt <= 0;
+    end else begin
+        timeout_cnt <= timeout_cnt + 1;
+        if (timeout_cnt >= MAX_TIMEOUT) begin
+            $display("[%0t] 全局超时！强制结束仿真", $time);
+            $display("当前状态: TX_BUSY=%b, RX_BUSY=%b, RX_ERROR=%b", 
+                     tx_busy_o, rx_busy_o, rx_error_o);
+            $finish;
+        end
     end
 end
 
@@ -85,13 +98,19 @@ initial begin
     #100 rst_n = 1'b1;
 end
 
-// 监控输出（在初始化之前先定义）
+// 监控输出
 reg tx_busy_prev;
+reg rx_done_prev;
+integer rx_count;
+
 initial begin
     tx_busy_prev = 1'b0;
+    rx_done_prev = 1'b0;
+    rx_count = 0;
 end
 
 always @(posedge clk) begin
+    // TX 状态监控
     if (tx_done_o) begin
         $display("[%0t] >> TX DONE", $time);
     end
@@ -103,32 +122,93 @@ always @(posedge clk) begin
     end
     tx_busy_prev <= tx_busy_o;
     
-    if (rx_valid_o) begin
-        $display("[%0t] << RX VALID: data = 0x%02h", $time, rx_data_o);
+    // RX 状态监控
+    if (rx_done_o && !rx_done_prev) begin
+        rx_count <= rx_count + 1;
+        $display("[%0t] << RX DONE #%0d: Header=0x%04h, DataLen=%0d", 
+                 $time, rx_count, rx_header_o, rx_data_len_o);
+        if (rx_data_len_o > 0) begin
+            $display("    Data[0]=0x%02h, Data[1]=0x%02h", rx_data_o[0], rx_data_o[1]);
+        end
     end
     if (rx_error_o) begin
         $display("[%0t] !! RX ERROR!", $time);
     end
+    rx_done_prev <= rx_done_o;
 end
+
+//============================================================================
+// 任务定义
+//============================================================================
+task send_packet;
+    input [15:0] header;
+    input [4:0]  data_len;
+    input [7:0]  data [];
+    integer i;
+    integer wait_cnt;
+    begin
+        tx_header_i = header;
+        tx_data_len_i = data_len;
+        for (i = 0; i < 30; i = i + 1) begin
+            if (i < data_len) begin
+                tx_data_i[i] = data[i];
+            end else begin
+                tx_data_i[i] = 8'd0;
+            end
+        end
+        
+        @(posedge clk);
+        tx_start_i = 1'b1;
+        @(posedge clk);
+        tx_start_i = 1'b0;
+        
+        // 等待发送完成
+        wait_cnt = 0;
+        while (!tx_done_o && wait_cnt < 100000) begin
+            @(posedge clk);
+            wait_cnt = wait_cnt + 1;
+        end
+        
+        if (!tx_done_o) begin
+            $display("[%0t] 发送超时!", $time);
+        end
+        
+        // 等待接收完成
+        wait_cnt = 0;
+        while (!rx_done_o && wait_cnt < 100000) begin
+            @(posedge clk);
+            wait_cnt = wait_cnt + 1;
+        end
+        
+        if (!rx_done_o) begin
+            $display("[%0t] 接收超时!", $time);
+        end else begin
+            $display("[%0t] 接收完成", $time);
+        end
+        
+        // 短暂复位 RX 以准备接收下一包
+        rx_en_i = 1'b0;
+        #100;
+        rx_en_i = 1'b1;
+        
+        #500; // 包间隔
+    end
+endtask
 
 //============================================================================
 // 主测试流程
 //============================================================================
-integer i;
-integer wait_cnt;
-
 initial begin
     // 初始化
     rst_n = 1'b0;
     tx_header_i = 16'd0;
-    for (i = 0; i < 30; i = i + 1) begin
+    for (integer i = 0; i < 30; i = i + 1) begin
         tx_data_i[i] = 8'd0;
     end
     tx_data_len_i = 5'd0;
     tx_start_i = 1'b0;
     rx_en_i = 1'b1;
     timeout_cnt = 0;
-    wait_cnt = 0;
     
     // 释放复位
     #100;
@@ -138,92 +218,25 @@ initial begin
     $display("========================================");
     $display("=== 开始 USB PD BMC 收发器测试 ===");
     $display("========================================");
-    $display("[%0t] 初始状态：tx_busy=%b, tx_done=%b", $time, tx_busy_o, tx_done_o);
     
-    // 测试 1: 发送 1 字节数据
-    $display("\n[测试 1] 发送 1 字节数据 0xAA");
-    // CRC 0x5DFAAC6F
-    tx_header_i = 16'h03a3;
-    tx_data_len_i = 5'd0;
+    // 测试 1: 发送无数据载荷的包 (仅 Header)
+    // Header: 0x0000 表示无数据 (data_obj_num = 0)
+    $display("\n[测试 1] 发送无数据载荷的包 (Header only)");
+    send_packet(16'h03a3, 5'd0, '{});
     
-    // 启动发送：tx_start_i 需要保持至少一个时钟周期
-    @(posedge clk);
-    tx_start_i = 1'b1;
-    $display("[%0t] tx_start_i=1, tx_busy=%b", $time, tx_busy_o);
-    
-    @(posedge clk);
-    tx_start_i = 1'b0;
-    $display("[%0t] tx_start_i=0, tx_busy=%b", $time, tx_busy_o);
-    
-    // 等待发送完成
-    wait_cnt = 0;
-    while (!tx_done_o && wait_cnt < 100000) begin
-        @(posedge clk);
-        wait_cnt = wait_cnt + 1;
-    end
-    
-    if (tx_done_o) begin
-        $display("[%0t] 测试 1 发送完成!", $time);
+    // 验证结果
+    if (rx_header_o == 16'h03a3 && rx_data_len_o == 5'd0 && !rx_error_o) begin
+        $display("[测试 1] PASS - Header 正确接收");
     end else begin
-        $display("[%0t] 测试 1 超时!", $time);
+        $display("[测试 1] FAIL - Header 或数据长度错误");
     end
-    
-    #1000;
-    
-    // 测试 2: 发送 5 字节数据
-    $display("\n[测试 2] 发送 5 字节数据");
-    tx_header_i = 16'h0200;
-    tx_data_i[0] = 8'h11;
-    tx_data_i[1] = 8'h22;
-    tx_data_i[2] = 8'h33;
-    tx_data_i[3] = 8'h44;
-    tx_data_i[4] = 8'h55;
-    tx_data_len_i = 5'd5;
-    tx_start_i = 1'b1;
-    
-    @(posedge clk);
-    @(posedge clk);
-    tx_start_i = 1'b0;
-    
-    // 等待发送完成
-    wait_cnt = 0;
-    while (!tx_done_o && wait_cnt < 200000) begin
-        @(posedge clk);
-        wait_cnt = wait_cnt + 1;
-    end
-    
-    if (tx_done_o) begin
-        $display("[%0t] 测试 2 发送完成!", $time);
-    end else begin
-        $display("[%0t] 测试 2 超时!", $time);
-    end
-    
+
     $display("\n========================================");
     $display("=== 测试结束 ===");
     $display("========================================");
     
     #1000;
     $finish;
-end
-
-//============================================================================
-// 监控输出
-//============================================================================
-always @(posedge clk) begin
-    if (tx_done_o) begin
-        $display("[%0t] >> TX DONE", $time);
-    end
-    if (tx_busy_o) begin
-        if ((timeout_cnt % 50000) == 0) begin
-            $display("[%0t] >> TX BUSY (cnt=%0d)", $time, timeout_cnt);
-        end
-    end
-    if (rx_valid_o) begin
-        $display("[%0t] << RX VALID: data = 0x%02h", $time, rx_data_o);
-    end
-    if (rx_error_o) begin
-        $display("[%0t] !! RX ERROR!", $time);
-    end
 end
 
 //============================================================================

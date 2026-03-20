@@ -377,11 +377,19 @@ always @(posedge clk or negedge rst_n) begin
                             // 继续发送下一个CRC字节，使用锁存的final_crc_reg
                             else begin
                                 case (crc_byte_cnt)
-                                    2'd0: current_byte <= final_crc_reg[15:8];  // 第2个字节
-                                    2'd1: current_byte <= final_crc_reg[23:16]; // 第3个字节
-                                    2'd2: current_byte <= final_crc_reg[31:24]; // 第4个字节(最高字节)
+                                    2'd0: begin
+                                        current_byte <= final_crc_reg[15:8];  // 第2个字节
+                                        current_symbol <= encode_4b5b_data(final_crc_reg[11:8]);
+                                    end
+                                    2'd1: begin
+                                        current_byte <= final_crc_reg[23:16]; // 第3个字节
+                                        current_symbol <= encode_4b5b_data(final_crc_reg[19:16]);
+                                    end
+                                    2'd2: begin
+                                        current_byte <= final_crc_reg[31:24]; // 第4个字节
+                                        current_symbol <= encode_4b5b_data(final_crc_reg[27:24]);
+                                    end
                                 endcase
-                                current_symbol <= encode_4b5b_data(current_byte[3:0]);
                             end
                         end
                     end
