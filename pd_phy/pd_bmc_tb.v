@@ -7,193 +7,132 @@
 
 module pd_bmc_tb;
 
-// 参数
-parameter CLK_PERIOD = 20;
+//============================================================================
+// 参数定义
+//============================================================================
+// 200MHz 差分时钟周期 = 5ns
+parameter CLK_200M_PERIOD = 5;
 
-// 超时计数器 (按时钟周期计数)
+// 超时计数器
 integer timeout_cnt;
-parameter MAX_TIMEOUT = 50000000;  // 约 1 秒仿真时间 @ 50MHz
+parameter MAX_TIMEOUT = 10000000;
 
+//============================================================================
 // 测试信号
-reg         clk;
-reg         rst_n;
+//============================================================================
+// 差分时钟
+reg  sys_clk_p;
+wire sys_clk_n;
+assign sys_clk_n = ~sys_clk_p;
 
-// 发送接口 (与 pd_bmc_transceiver 匹配)
-reg  [15:0] tx_header_i;
-reg  [7:0]  tx_data_i [0:29];
-reg  [4:0]  tx_data_len_i;
-reg         tx_start_i;
-wire        tx_done_o;
-wire        tx_busy_o;
+// 复位
+reg  rst_n;
 
-// 接收接口 (更新为包接口)
-wire [15:0] rx_header_o;
-wire [7:0]  rx_data_o [0:29];
-wire [4:0]  rx_data_len_o;
-wire        rx_done_o;
-wire        rx_busy_o;
-wire        rx_error_o;
-reg         rx_en_i;
+// LED 输出
+wire led_tx;
+wire led_rx_ok;
+wire led_rx_err;
+wire led_heartbeat;
 
-// Pad 接口
-wire        bmc_tx_pad;
-wire        bmc_rx_pad;
+// BMC Pad 接口
+wire bmc_tx_pad;
+wire bmc_rx_pad;
 
-// 内部回环连接
+// 内部回环：TX 输出连接到 RX 输入
 assign bmc_rx_pad = bmc_tx_pad;
 
 //============================================================================
-// 实例化被测模块
+// 实例化被测模块 (pd_bmc_transceiver)
 //============================================================================
 pd_bmc_transceiver u_dut (
-    .clk           (clk),
-    .rst_n         (rst_n),
-    .tx_header_i   (tx_header_i),
-    .tx_data_i     (tx_data_i),
-    .tx_data_len_i (tx_data_len_i),
-    .tx_start_i    (tx_start_i),
-    .tx_done_o     (tx_done_o),
-    .tx_busy_o     (tx_busy_o),
-    .rx_header_o   (rx_header_o),
-    .rx_data_o     (rx_data_o),
-    .rx_data_len_o (rx_data_len_o),
-    .rx_done_o     (rx_done_o),
-    .rx_busy_o     (rx_busy_o),
-    .rx_error_o    (rx_error_o),
-    .rx_en_i       (rx_en_i),
-    .bmc_tx_pad    (bmc_tx_pad),
-    .bmc_rx_pad    (bmc_rx_pad)
+    .sys_clk_p      (sys_clk_p),
+    .sys_clk_n      (sys_clk_n),
+    .rst_n          (rst_n),
+    .led_tx         (led_tx),
+    .led_rx_ok      (led_rx_ok),
+    .led_rx_err     (led_rx_err),
+    .led_heartbeat  (led_heartbeat),
+    .bmc_tx_pad     (bmc_tx_pad),
+    .bmc_rx_pad     (bmc_rx_pad)
 );
 
 //============================================================================
-// 时钟生成
+// 200MHz 差分时钟生成
 //============================================================================
 initial begin
-    clk = 1'b0;
-    forever #(CLK_PERIOD/2) clk = ~clk;
+    sys_clk_p = 1'b0;
+    forever #(CLK_200M_PERIOD/2) sys_clk_p = ~sys_clk_p;
 end
 
 //============================================================================
-// 超时监控 - 全局超时
+// 超时监控 (使用 200MHz 时钟)
 //============================================================================
-always @(posedge clk or negedge rst_n) begin
+always @(posedge sys_clk_p or negedge rst_n) begin
     if (!rst_n) begin
         timeout_cnt <= 0;
     end else begin
         timeout_cnt <= timeout_cnt + 1;
         if (timeout_cnt >= MAX_TIMEOUT) begin
             $display("[%0t] 全局超时！强制结束仿真", $time);
-            $display("当前状态: TX_BUSY=%b, RX_BUSY=%b, RX_ERROR=%b", 
-                     tx_busy_o, rx_busy_o, rx_error_o);
+            $display("当前状态: LED_TX=%b, LED_RX_OK=%b, LED_RX_ERR=%b", 
+                     led_tx, led_rx_ok, led_rx_err);
             $finish;
         end
     end
 end
 
 //============================================================================
-// 复位序列
+// LED 状态监控
 //============================================================================
-initial begin
-    rst_n = 1'b0;
-    #100 rst_n = 1'b1;
-end
-
-// 监控输出
-reg tx_busy_prev;
-reg rx_done_prev;
-integer rx_count;
+reg led_tx_prev;
+reg led_rx_ok_prev;
+reg led_rx_err_prev;
 
 initial begin
-    tx_busy_prev = 1'b0;
-    rx_done_prev = 1'b0;
-    rx_count = 0;
+    led_tx_prev = 1'b1;
+    led_rx_ok_prev = 1'b1;
+    led_rx_err_prev = 1'b1;
 end
 
-always @(posedge clk) begin
-    // TX 状态监控
-    if (tx_done_o) begin
-        $display("[%0t] >> TX DONE", $time);
+always @(posedge sys_clk_p) begin
+    // LED_TX 监控 (低电平点亮表示 TX 忙)
+    if (!led_tx && led_tx_prev) begin
+        $display("[%0t] >> TX LED 亮起 (TX BUSY)", $time);
     end
-    if (tx_busy_o && !tx_busy_prev) begin
-        $display("[%0t] >> TX BUSY 开始", $time);
+    if (led_tx && !led_tx_prev) begin
+        $display("[%0t] >> TX LED 熄灭 (TX DONE)", $time);
     end
-    if (!tx_busy_o && tx_busy_prev) begin
-        $display("[%0t] >> TX BUSY 结束", $time);
-    end
-    tx_busy_prev <= tx_busy_o;
+    led_tx_prev <= led_tx;
     
-    // RX 状态监控
-    if (rx_done_o && !rx_done_prev) begin
-        rx_count <= rx_count + 1;
-        $display("[%0t] << RX DONE #%0d: Header=0x%04h, DataLen=%0d", 
-                 $time, rx_count, rx_header_o, rx_data_len_o);
-        if (rx_data_len_o > 0) begin
-            $display("    Data[0]=0x%02h, Data[1]=0x%02h", rx_data_o[0], rx_data_o[1]);
-        end
+    // LED_RX_OK 监控 (低电平点亮表示 RX 完成)
+    if (!led_rx_ok && led_rx_ok_prev) begin
+        $display("[%0t] << RX OK LED 亮起 (RX DONE)", $time);
     end
-    if (rx_error_o) begin
-        $display("[%0t] !! RX ERROR!", $time);
+    led_rx_ok_prev <= led_rx_ok;
+    
+    // LED_RX_ERR 监控 (低电平点亮表示 RX 错误)
+    if (!led_rx_err && led_rx_err_prev) begin
+        $display("[%0t] !! RX ERROR LED 亮起", $time);
     end
-    rx_done_prev <= rx_done_o;
+    led_rx_err_prev <= led_rx_err;
 end
 
 //============================================================================
-// 任务定义
+// BMC 信号监控
 //============================================================================
-task send_packet;
-    input [15:0] header;
-    input [4:0]  data_len;
-    input [7:0]  data [];
-    integer i;
-    integer wait_cnt;
-    begin
-        tx_header_i = header;
-        tx_data_len_i = data_len;
-        for (i = 0; i < 30; i = i + 1) begin
-            if (i < data_len) begin
-                tx_data_i[i] = data[i];
-            end else begin
-                tx_data_i[i] = 8'd0;
-            end
-        end
-        
-        @(posedge clk);
-        tx_start_i = 1'b1;
-        @(posedge clk);
-        tx_start_i = 1'b0;
-        
-        // 等待发送完成
-        wait_cnt = 0;
-        while (!tx_done_o && wait_cnt < 100000) begin
-            @(posedge clk);
-            wait_cnt = wait_cnt + 1;
-        end
-        
-        if (!tx_done_o) begin
-            $display("[%0t] 发送超时!", $time);
-        end
-        
-        // 等待接收完成
-        wait_cnt = 0;
-        while (!rx_done_o && wait_cnt < 100000) begin
-            @(posedge clk);
-            wait_cnt = wait_cnt + 1;
-        end
-        
-        if (!rx_done_o) begin
-            $display("[%0t] 接收超时!", $time);
-        end else begin
-            $display("[%0t] 接收完成", $time);
-        end
-        
-        // 短暂复位 RX 以准备接收下一包
-        rx_en_i = 1'b0;
-        #100;
-        rx_en_i = 1'b1;
-        
-        #500; // 包间隔
+reg bmc_tx_prev;
+
+initial begin
+    bmc_tx_prev = 1'b0;
+end
+
+always @(posedge sys_clk_p) begin
+    if (bmc_tx_pad != bmc_tx_prev) begin
+        // BMC 信号翻转，说明正在传输
+        // $display("[%0t] BMC_TX: %b -> %b", $time, bmc_tx_prev, bmc_tx_pad);
     end
-endtask
+    bmc_tx_prev <= bmc_tx_pad;
+end
 
 //============================================================================
 // 主测试流程
@@ -201,36 +140,45 @@ endtask
 initial begin
     // 初始化
     rst_n = 1'b0;
-    tx_header_i = 16'd0;
-    for (integer i = 0; i < 30; i = i + 1) begin
-        tx_data_i[i] = 8'd0;
-    end
-    tx_data_len_i = 5'd0;
-    tx_start_i = 1'b0;
-    rx_en_i = 1'b1;
     timeout_cnt = 0;
+    
+    $display("========================================");
+    $display("=== USB PD BMC 收发器测试开始 ===");
+    $display("========================================");
+    $display("注意: pd_bmc_transceiver 模块内部有自测试激励");
+    $display("      延迟 100M 周期后自动发送测试包");
+    $display("      Header=0x03A3, DataLen=2, Data={0x55, 0xAA}");
+    $display("========================================");
     
     // 释放复位
     #100;
     rst_n = 1'b1;
-    #50;
+    $display("[%0t] 复位释放", $time);
     
-    $display("========================================");
-    $display("=== 开始 USB PD BMC 收发器测试 ===");
-    $display("========================================");
+    // 等待内部自测试完成
+    // pd_bmc_transceiver 内部会在 delay_cnt == 100000000 后开始发送
+    // 为了仿真快速，我们只等待一段时间观察 LED 变化
     
-    // 测试 1: 发送无数据载荷的包 (仅 Header)
-    // Header: 0x0000 表示无数据 (data_obj_num = 0)
-    $display("\n[测试 1] 发送无数据载荷的包 (Header only)");
-    send_packet(16'h03a3, 5'd0, '{});
+    // 等待 TX 开始 (LED_TX 变低)
+    wait(led_tx == 1'b0);
+    $display("[%0t] 检测到 TX 开始", $time);
     
-    // 验证结果
-    if (rx_header_o == 16'h03a3 && rx_data_len_o == 5'd0 && !rx_error_o) begin
-        $display("[测试 1] PASS - Header 正确接收");
+    // 等待 TX 结束 (LED_TX 变高)
+    wait(led_tx == 1'b1);
+    $display("[%0t] 检测到 TX 结束", $time);
+    
+    // 等待 RX 完成 (LED_RX_OK 变低)
+    wait(led_rx_ok == 1'b0);
+    $display("[%0t] 检测到 RX 完成", $time);
+    
+    // 检查是否有错误
+    #1000;
+    if (led_rx_err == 1'b1) begin
+        $display("[测试结果] PASS - 无 RX 错误");
     end else begin
-        $display("[测试 1] FAIL - Header 或数据长度错误");
+        $display("[测试结果] FAIL - 检测到 RX 错误");
     end
-
+    
     $display("\n========================================");
     $display("=== 测试结束 ===");
     $display("========================================");

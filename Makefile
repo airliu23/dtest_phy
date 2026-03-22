@@ -45,7 +45,7 @@ RTLIL_OUTPUT = pd_bmc.rtlil
 # ----------------------------------------------------------------------------
 # Icarus Verilog 编译标志
 # 使用-g2012 启用 SystemVerilog 特性（支持数组端口）
-IVERILOG_FLAGS = -g2012 -Wall
+IVERILOG_FLAGS = -g2012 -Wall -DSIMULATION
 
 # 定义参数 (可覆盖模块中的 parameter)
 # 例如：-P CLK_FREQ_MHZ=100 将系统时钟设为 100MHz

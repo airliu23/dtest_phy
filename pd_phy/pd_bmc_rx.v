@@ -14,7 +14,7 @@ module pd_bmc_rx (
     
     // 接收完成包接口
     output reg  [15:0]        rx_header_o,
-    output reg  [7:0]         rx_data_o [0:29],
+    output wire [239:0]       rx_data_flat_o, // 【修复】展平的输出端口
     output reg  [4:0]         rx_data_len_o,
     output reg                rx_done_o,
     output reg                rx_busy_o,
@@ -40,18 +40,16 @@ localparam KCODE_EOP    = 5'b01101;
 // 接收状态机 (极简版)
 localparam ST_IDLE      = 4'd0;
 localparam ST_PREAMBLE  = 4'd1;
-localparam ST_RECEIVE   = 4'd2;  // 接收所有数据（Preamble + SOP + Header + Data + CRC），直到EOP
+localparam ST_RECEIVE   = 4'd2;  // SOP + Header + Data + CRC），直到EOP
 localparam ST_DONE      = 4'd3;
 
 //============================================================================
 // 边沿检测参数
 //============================================================================
-// 半周期窗口：用于检测数据1的中间跳变
-localparam HALF_BIT_MIN = HALF_BIT_CNT - 15;  // 68
-localparam HALF_BIT_MAX = HALF_BIT_CNT + 15;  // 98
-// 全周期窗口：用于检测数据0的周期跳变
-localparam FULL_BIT_MIN = BIT_PERIOD_CNT - 20; // 146
-localparam FULL_BIT_MAX = BIT_PERIOD_CNT + 20; // 186
+localparam HALF_BIT_MIN = HALF_BIT_CNT - 15;
+localparam HALF_BIT_MAX = HALF_BIT_CNT + 15;
+localparam FULL_BIT_MIN = BIT_PERIOD_CNT - 20;
+localparam FULL_BIT_MAX = BIT_PERIOD_CNT + 20;
 
 //============================================================================
 // 输入同步与边沿检测
@@ -176,11 +174,25 @@ reg        byte_nibble_sel;
 // 数据寄存器
 reg [4:0]  current_symbol;
 reg [7:0]  current_byte;
-reg [7:0]  now_byte;
 reg [15:0] rx_header_reg;
 reg [31:0] crc_reg;
 
+// 【修复1】声明内部数据数组，用于暂存接收数据
+reg [7:0]  rx_data_reg [0:29];
+
+//============================================================================
+// 【修复2】添加：内部数组 -> 展平输出端口 的映射逻辑
+//============================================================================
+genvar k;
+generate
+    for (k = 0; k < 30; k = k + 1) begin : gen_rx_data_map
+        assign rx_data_flat_o[k*8 +: 8] = rx_data_reg[k];
+    end
+endgenerate
+
+//============================================================================
 // CRC计算
+//============================================================================
 function [31:0] calc_crc32;
     input [31:0] crc_in;
     input [7:0]  data_in;
@@ -197,7 +209,9 @@ function [31:0] calc_crc32;
     end
 endfunction
 
+//============================================================================
 // 4B5B解码
+//============================================================================
 function [3:0] decode_4b5b_data;
     input [4:0] symbol_5b;
     begin
@@ -223,6 +237,8 @@ function [3:0] decode_4b5b_data;
     end
 endfunction
 
+integer i; // 循环变量声明移到 always 块内部
+
 //============================================================================
 // 主状态机
 //============================================================================
@@ -242,8 +258,10 @@ always @(posedge clk or negedge rst_n) begin
         current_byte <= 8'd0;
         rx_header_reg <= 16'd0;
         crc_reg <= 32'hFFFFFFFF;
-        for (integer i = 0; i < 30; i = i + 1) begin
-            rx_data_o[i] <= 8'd0;
+        
+        // 复位内部数组 rx_data_reg
+        for (i = 0; i < 30; i = i + 1) begin
+            rx_data_reg[i] <= 8'd0;
         end
     end else begin
         rx_done_o <= 1'b0;
@@ -267,9 +285,6 @@ always @(posedge clk or negedge rst_n) begin
                     preamble_cnt <= preamble_cnt + 1'b1;
                     
                     if (preamble_cnt == PREAMBLE_LEN - 1) begin
-                        $display("[%0t] RX PREAMBLE done, entering RECEIVE", $time);
-                        // Preamble 接收完成，进入接收阶段
-                        // 注意：不重置 BMC 解码器，保持同步
                         byte_cnt <= 5'd0;
                         byte_nibble_sel <= 1'b0;
                         symbol_bit_cnt <= 3'd0;
@@ -289,36 +304,26 @@ always @(posedge clk or negedge rst_n) begin
                         symbol_bit_cnt <= 3'd0;
                         // 检查是否是 EOP KCODE
                         if (current_symbol == KCODE_EOP) begin
-                            $display("[%0t] RX RECEIVE: EOP detected, received %d bytes", $time, byte_cnt);
-                            // 数据长度 = 总字节数 - SOP的2字节
                             rx_data_len_o <= (byte_cnt > 2) ? (byte_cnt - 2) : 0;
                             rx_done_o <= 1'b1;
                             rx_busy_o <= 1'b0;
-                            // 从接收的数据中提取 Header (跳过SOP的4个符号=2字节)
-                            // SOP: 3个SYNC1 + 1个SYNC2 = 4个符号 = 2字节
-                            // Header在Byte 2和Byte 3
+                            
                             if (byte_cnt >= 4) begin
-                                rx_header_o <= {rx_data_o[3], rx_data_o[2]};
+                                // 从内部数组 rx_data_reg 提取 Header
+                                rx_header_o <= {rx_data_reg[3], rx_data_reg[2]};
                             end
                             rx_state <= ST_DONE;
                         end else begin
-                            // 正常数据符号，解码并保存
                             if (!byte_nibble_sel) begin
-                                // 接收低 nibble
                                 current_byte[3:0] = decode_4b5b_data(current_symbol);
                             end else begin
-                                // 接收高 nibble，字节完成
-                                // 使用临时变量保存解码后的高 nibble
                                 current_byte[7:4] = decode_4b5b_data(current_symbol);
-                                // 保存完整的字节到 rx_data_o（使用组合逻辑计算）
-                                rx_data_o[byte_cnt] <= {decode_4b5b_data(current_symbol), current_byte[3:0]};
-                                $display("[%0t] RX RECEIVE: byte[%d]=0x%02h", $time, byte_cnt, {decode_4b5b_data(current_symbol), current_byte[3:0]});
+                                // 保存到内部数组 rx_data_reg
+                                rx_data_reg[byte_cnt] <= {decode_4b5b_data(current_symbol), current_byte[3:0]};
                                 
                                 byte_cnt <= byte_cnt + 1'b1;
                                 
-                                // 检查是否超出最大长度
                                 if (byte_cnt >= MAX_DATA_LEN - 1) begin
-                                    $display("[%0t] RX RECEIVE: max length reached", $time);
                                     rx_error_o <= 1'b1;
                                     rx_state <= ST_IDLE;
                                 end
@@ -334,7 +339,6 @@ always @(posedge clk or negedge rst_n) begin
                 rx_error_o <= 1'b0;
                 // 保持 rx_done_o 置位，直到检测到新的边沿（下一包开始）
                 if (any_edge) begin
-                    $display("[%0t] RX DONE: edge detected, going to PREAMBLE", $time);
                     rx_done_o <= 1'b0;
                     rx_state <= ST_PREAMBLE;
                 end
