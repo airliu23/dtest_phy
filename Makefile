@@ -23,18 +23,30 @@ GTKWAVE = gtkwave
 # PD PHY 模块目录
 PD_PHY_DIR = pd_phy
 
-# 源文件
-SRCS = $(PD_PHY_DIR)/pd_bmc_tx.v $(PD_PHY_DIR)/pd_bmc_rx.v $(PD_PHY_DIR)/pd_bmc_transceiver.v
+# 顶层源文件
+TOP_SRCS = dtest_phy.v spi_slave.v pd_phy_regs.v
+
+# PD PHY 子模块 (纯 PD 功能)
+PHY_SRCS = $(PD_PHY_DIR)/pd_bmc_tx.v \
+           $(PD_PHY_DIR)/pd_bmc_rx.v \
+           $(PD_PHY_DIR)/pd_bmc_transceiver.v
+
+# 所有源文件
+SRCS = $(TOP_SRCS) $(PHY_SRCS)
 
 # 测试平台
-TB = $(PD_PHY_DIR)/pd_bmc_tb.v
+TB_PHY = $(PD_PHY_DIR)/pd_bmc_tb.v
+TB_TOP = dtest_phy_tb.v
+
+# 默认测试平台 (顶层)
+TB = $(TB_TOP)
 
 # 所有 Verilog 文件
 ALL_SRCS = $(SRCS) $(TB)
 
 # 输出文件名
-SIM_OUTPUT = pd_bmc_sim
-WAVEFORM = pd_bmc_tb.vcd
+SIM_OUTPUT = dtest_phy.sim
+WAVEFORM = dtest_phy_tb.vcd
 
 # 综合输出 (可选)
 SYNTH_OUTPUT = pd_bmc_synthesis.json
