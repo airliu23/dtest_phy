@@ -3,13 +3,14 @@
 // 提供 MCU 通过 SPI 访问 TX/RX 模块的寄存器映射
 //============================================================================
 // 寄存器地址映射:
-// 0x00       CTRL        控制寄存器 [0]:TX_START [1]:RX_EN [7]:SOFT_RST
-// 0x01       STATUS      状态寄存器 [0]:TX_BUSY [1]:TX_DONE [2]:RX_BUSY [3]:RX_DONE [4]:RX_ERROR
+// 0x00       CTRL        控制寄存器 [0]:TX_START [1]:RX_EN [2]:AUTO_GOODCRC [3]:LOOPBACK [7]:SOFT_RST
+// 0x01       STATUS      状态寄存器 [0]:TX_BUSY [1]:TX_DONE [2]:TX_FAIL [3]:RX_BUSY [4]:RX_DONE [5]:RX_CRC_OK [6]:RX_ERROR
 // 0x02       TX_HDR_L    发送 Header 低字节
 // 0x03       TX_HDR_H    发送 Header 高字节
 // 0x04       TX_LEN      发送数据长度 (0-30)
-// 0x05       IRQ_EN      中断使能 [0]:TX_DONE_IE [1]:RX_DONE_IE [2]:RX_ERR_IE
-// 0x06       IRQ_FLAG    中断标志 (写1清除) [0]:TX_DONE_IF [1]:RX_DONE_IF [2]:RX_ERR_IF
+// 0x05       IRQ_EN      中断使能 [0]:TX_DONE_IE [1]:TX_FAIL_IE [2]:RX_DONE_IE [3]:RX_ERR_IE
+// 0x06       IRQ_FLAG    中断标志 (劙1清除) [0]:TX_DONE_IF [1]:TX_FAIL_IF [2]:RX_DONE_IF [3]:RX_ERR_IF
+// 0x07       MSG_ID      消息ID [2:0]:MSG_ID
 // 0x10-0x2D  TX_DATA     发送数据缓冲区 (30 字节)
 // 0x40       RX_HDR_L    接收 Header 低字节 (只读)
 // 0x41       RX_HDR_H    接收 Header 高字节 (只读)
@@ -36,6 +37,7 @@ module pd_phy_regs (
     output reg  [4:0]   tx_data_len,
     output reg          tx_start,
     input  wire         tx_done,
+    input  wire         tx_fail,
     input  wire         tx_busy,
     
     // RX 模块接口
@@ -45,7 +47,13 @@ module pd_phy_regs (
     input  wire         rx_done,
     input  wire         rx_busy,
     input  wire         rx_error,
+    input  wire         rx_crc_ok,
     output reg          rx_en,
+    
+    // 协议配置
+    output reg  [2:0]   msg_id,
+    output reg          auto_goodcrc,
+    output reg          loopback_mode,
     
     // 中断输出
     output wire         irq_n
@@ -61,6 +69,7 @@ localparam ADDR_TX_HDR_H = 8'h03;
 localparam ADDR_TX_LEN   = 8'h04;
 localparam ADDR_IRQ_EN   = 8'h05;
 localparam ADDR_IRQ_FLAG = 8'h06;
+localparam ADDR_MSG_ID   = 8'h07;
 localparam ADDR_TX_DATA  = 8'h10;  // 0x10 - 0x2D
 localparam ADDR_RX_HDR_L = 8'h40;
 localparam ADDR_RX_HDR_H = 8'h41;
@@ -73,29 +82,46 @@ localparam ADDR_RX_DATA  = 8'h50;  // 0x50 - 0x6D
 reg [7:0] irq_en_reg;
 reg [7:0] irq_flag_reg;
 
-// TX_DONE 和 RX_DONE 边沿检测
+// TX_DONE/TX_FAIL 和 RX_DONE/RX_ERROR 边沿检测
 reg tx_done_d;
+reg tx_fail_d;
 reg rx_done_d;
 reg rx_error_d;
 
-wire tx_done_rising = tx_done && !tx_done_d;
-wire rx_done_rising = rx_done && !rx_done_d;
+// RX_CRC_OK 锁存寄存器 - 在RX_DONE时保存，下次RX启动时清除
+reg rx_crc_ok_latched;
+
+wire tx_done_rising  = tx_done && !tx_done_d;
+wire tx_fail_rising  = tx_fail && !tx_fail_d;
+wire rx_done_rising  = rx_done && !rx_done_d;
 wire rx_error_rising = rx_error && !rx_error_d;
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         tx_done_d  <= 1'b0;
+        tx_fail_d  <= 1'b0;
         rx_done_d  <= 1'b0;
         rx_error_d <= 1'b0;
+        rx_crc_ok_latched <= 1'b0;
     end else begin
         tx_done_d  <= tx_done;
+        tx_fail_d  <= tx_fail;
         rx_done_d  <= rx_done;
         rx_error_d <= rx_error;
+        
+        // 锁存 rx_crc_ok：在RX_DONE上升沿保存，下次RX_BUSY上升沿清除
+        if (rx_done_rising) begin
+            rx_crc_ok_latched <= rx_crc_ok;
+        end else if (rx_busy && !rx_done) begin
+            // RX开始新的接收，清除锁存
+            rx_crc_ok_latched <= 1'b0;
+        end
     end
 end
 
 //============================================================================
 // 中断标志更新
+// [0]:TX_DONE_IF [1]:TX_FAIL_IF [2]:RX_DONE_IF [3]:RX_ERR_IF
 //============================================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -103,10 +129,11 @@ always @(posedge clk or negedge rst_n) begin
     end else begin
         // 硬件置位
         if (tx_done_rising)  irq_flag_reg[0] <= 1'b1;
-        if (rx_done_rising)  irq_flag_reg[1] <= 1'b1;
-        if (rx_error_rising) irq_flag_reg[2] <= 1'b1;
+        if (tx_fail_rising)  irq_flag_reg[1] <= 1'b1;
+        if (rx_done_rising)  irq_flag_reg[2] <= 1'b1;
+        if (rx_error_rising) irq_flag_reg[3] <= 1'b1;
         
-        // 写1清除
+        // 劙1清除
         if (reg_wr_en && reg_addr == ADDR_IRQ_FLAG) begin
             irq_flag_reg <= irq_flag_reg & ~reg_wr_data;
         end
@@ -127,6 +154,9 @@ always @(posedge clk or negedge rst_n) begin
         tx_start     <= 1'b0;
         rx_en        <= 1'b1;
         irq_en_reg   <= 8'h00;
+        msg_id       <= 3'd0;
+        auto_goodcrc <= 1'b1;  // 默认启用自动 GoodCRC
+        loopback_mode <= 1'b0;
     end else begin
         // 默认清除 tx_start (单周期脉冲)
         tx_start <= 1'b0;
@@ -134,14 +164,17 @@ always @(posedge clk or negedge rst_n) begin
         if (reg_wr_en) begin
             case (reg_addr)
                 ADDR_CTRL: begin
-                    tx_start <= reg_wr_data[0];
-                    rx_en    <= reg_wr_data[1];
+                    tx_start      <= reg_wr_data[0];
+                    rx_en         <= reg_wr_data[1];
+                    auto_goodcrc  <= reg_wr_data[2];
+                    loopback_mode <= reg_wr_data[3];
                 end
                 
                 ADDR_TX_HDR_L: tx_header[7:0]  <= reg_wr_data;
                 ADDR_TX_HDR_H: tx_header[15:8] <= reg_wr_data;
                 ADDR_TX_LEN:   tx_data_len     <= reg_wr_data[4:0];
                 ADDR_IRQ_EN:   irq_en_reg      <= reg_wr_data;
+                ADDR_MSG_ID:   msg_id          <= reg_wr_data[2:0];
                 
                 default: begin
                     // TX_DATA 区域 (0x10 - 0x2D)
@@ -193,13 +226,15 @@ always @(*) begin
     reg_rd_data = 8'h00;
     
     case (reg_addr)
-        ADDR_CTRL:     reg_rd_data = {6'b0, rx_en, 1'b0};
-        ADDR_STATUS:   reg_rd_data = {3'b0, rx_error, rx_done, rx_busy, tx_done, tx_busy};
+        ADDR_CTRL:     reg_rd_data = {4'b0, loopback_mode, auto_goodcrc, rx_en, 1'b0};
+        // STATUS: [5]=RX_CRC_OK (锁存值), [4]=RX_DONE, [3]=RX_BUSY, [2]=TX_FAIL, [1]=TX_DONE, [0]=TX_BUSY
+        ADDR_STATUS:   reg_rd_data = {1'b0, rx_error, rx_crc_ok_latched, rx_done, rx_busy, tx_fail, tx_done, tx_busy};
         ADDR_TX_HDR_L: reg_rd_data = tx_header[7:0];
         ADDR_TX_HDR_H: reg_rd_data = tx_header[15:8];
         ADDR_TX_LEN:   reg_rd_data = {3'b0, tx_data_len};
         ADDR_IRQ_EN:   reg_rd_data = irq_en_reg;
         ADDR_IRQ_FLAG: reg_rd_data = irq_flag_reg;
+        ADDR_MSG_ID:   reg_rd_data = {5'b0, msg_id};
         ADDR_RX_HDR_L: reg_rd_data = rx_header[7:0];
         ADDR_RX_HDR_H: reg_rd_data = rx_header[15:8];
         ADDR_RX_LEN:   reg_rd_data = {3'b0, rx_data_len};

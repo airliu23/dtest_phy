@@ -37,16 +37,18 @@ SRCS = $(TOP_SRCS) $(PHY_SRCS)
 # 测试平台
 TB_PHY = $(PD_PHY_DIR)/pd_bmc_tb.v
 TB_TOP = dtest_phy_tb.v
+# TB_AB = dtest_phy_ab_tb.v
 
 # 默认测试平台 (顶层)
 TB = $(TB_TOP)
 
 # 所有 Verilog 文件
 ALL_SRCS = $(SRCS) $(TB)
+# ALL_SRCS_AB = $(SRCS) $(TB_AB)
 
 # 输出文件名
 SIM_OUTPUT = dtest_phy.sim
-WAVEFORM = dtest_phy_tb.vcd
+WAVEFORM = dtest_phy.vcd
 
 # 综合输出 (可选)
 SYNTH_OUTPUT = pd_bmc_synthesis.json
@@ -70,6 +72,26 @@ DEFINES =
 # 默认目标：编译并运行仿真
 .PHONY: all
 all: compile simulate
+
+# A->B 通信测试
+.PHONY: ab-test
+ab-test: compile-ab simulate-ab
+
+.PHONY: compile-ab
+compile-ab:
+	@echo "========================================"
+	@echo "编译 A->B 通信测试..."
+	@echo "========================================"
+	$(IVERILOG) $(IVERILOG_FLAGS) $(DEFINES) -o dtest_phy_ab.sim $(ALL_SRCS_AB)
+	@echo "编译完成！输出文件：dtest_phy_ab.sim"
+
+.PHONY: simulate-ab
+simulate-ab:
+	@echo "========================================"
+	@echo "运行 A->B 通信测试..."
+	@echo "========================================"
+	$(VVP) dtest_phy_ab.sim
+	@echo "仿真完成！波形文件：dtest_phy_ab_tb.vcd"
 
 # 编译目标
 .PHONY: compile build
@@ -113,6 +135,7 @@ waveform: $(WAVEFORM)
 clean:
 	@echo "清理生成的文件..."
 	rm -f $(SIM_OUTPUT) $(WAVEFORM) $(WAVEFORM).bak
+	rm -f dtest_phy_ab.sim dtest_phy_ab_tb.vcd
 	rm -f $(SYNTH_OUTPUT) $(RTLIL_OUTPUT)
 	@echo "清理完成"
 
@@ -169,6 +192,7 @@ help:
 	@echo ""
 	@echo "主要目标:"
 	@echo "  all       - 编译并运行仿真 (默认)"
+	@echo "  ab-test   - 运行 A->B 通信测试"
 	@echo "  compile   - 仅编译，不运行仿真"
 	@echo "  simulate  - 运行仿真（需要先编译）"
 	@echo "  rebuild   - 重新编译"
@@ -187,6 +211,7 @@ help:
 	@echo ""
 	@echo "示例用法:"
 	@echo "  make                    # 编译并运行仿真"
+	@echo "  make ab-test            # 运行 A->B 通信测试"
 	@echo "  make wave               # 打开波形查看器"
 	@echo "  make DEFINES=-PCLK_FREQ_MHZ=100  # 使用不同时钟频率编译"
 	@echo ""

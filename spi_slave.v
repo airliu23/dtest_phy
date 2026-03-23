@@ -1,8 +1,10 @@
 //============================================================================
 // SPI 从机接口模块
 // 支持 Mode 0 (CPOL=0, CPHA=0)
-// 协议: [1字节地址][1字节数据] (MSB first)
-// 地址最高位: 0=读, 1=写
+// 协议: [4字节地址][1字节数据] (MSB first)
+// 地址格式: [31]=R/W, [30:16]=模块ID, [15:0]=寄存器地址
+//   R/W: 0=读, 1=写
+//   模块ID: 0x0001=PD, 0x0002=UFCS, ...
 //============================================================================
 
 `timescale 1ns/1ps
@@ -17,10 +19,10 @@ module spi_slave (
     input  wire        spi_mosi,      // 主出从入
     output reg         spi_miso,      // 主入从出
     
-    // 寄存器接口
+    // 寄存器接口 (32位地址)
     output reg         reg_wr_en,     // 寄存器写使能
     output reg         reg_rd_en,     // 寄存器读使能
-    output reg  [7:0]  reg_addr,      // 寄存器地址
+    output reg  [30:0] reg_addr,      // 寄存器地址 (不含R/W位)
     output reg  [7:0]  reg_wr_data,   // 写数据
     input  wire [7:0]  reg_rd_data    // 读数据
 );
@@ -48,7 +50,6 @@ end
 wire sclk_rising  = (sclk_sync[2:1] == 2'b01);
 wire sclk_falling = (sclk_sync[2:1] == 2'b10);
 wire cs_n_active  = ~cs_n_sync[2];
-wire cs_n_rising  = (cs_n_sync[2:1] == 2'b01);
 wire mosi_data    = mosi_sync[1];
 
 //============================================================================
@@ -61,20 +62,20 @@ localparam STATE_DATA      = 3'd3;
 localparam STATE_DONE      = 3'd4;
 
 reg [2:0]  state;
-reg [2:0]  bit_cnt;
-reg [7:0]  shift_in;
+reg [5:0]  bit_cnt;       // 扩展到 6 位支持 32 位地址
+reg [31:0] shift_in;      // 扩展到 32 位
 reg [7:0]  shift_out;
 reg        is_write;
-reg        miso_loaded;  // 标记 MISO 是否已加载
+reg        miso_loaded;
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         state       <= STATE_IDLE;
-        bit_cnt     <= 3'd0;
-        shift_in    <= 8'd0;
+        bit_cnt     <= 6'd0;
+        shift_in    <= 32'd0;
         shift_out   <= 8'd0;
         is_write    <= 1'b0;
-        reg_addr    <= 8'd0;
+        reg_addr    <= 31'd0;
         reg_wr_data <= 8'd0;
         reg_wr_en   <= 1'b0;
         reg_rd_en   <= 1'b0;
@@ -88,30 +89,30 @@ always @(posedge clk or negedge rst_n) begin
         // CS 释放时复位
         if (!cs_n_active) begin
             state       <= STATE_IDLE;
-            bit_cnt     <= 3'd0;
+            bit_cnt     <= 6'd0;
             spi_miso    <= 1'b0;
             miso_loaded <= 1'b0;
         end else begin
             case (state)
                 STATE_IDLE: begin
-                    bit_cnt     <= 3'd0;
-                    shift_in    <= 8'd0;
+                    bit_cnt     <= 6'd0;
+                    shift_in    <= 32'd0;
                     miso_loaded <= 1'b0;
                     state       <= STATE_ADDR;
                 end
                 
                 STATE_ADDR: begin
-                    // SCLK 上升沿采样 MOSI
+                    // SCLK 上升沿采样 MOSI (32位地址)
                     if (sclk_rising) begin
-                        shift_in <= {shift_in[6:0], mosi_data};
+                        shift_in <= {shift_in[30:0], mosi_data};
                         bit_cnt  <= bit_cnt + 1'b1;
                         
-                        if (bit_cnt == 3'd7) begin
-                            // 地址字节接收完成
-                            reg_addr <= {shift_in[5:0], mosi_data};
-                            is_write <= shift_in[6];  // bit7 是读写标志
+                        if (bit_cnt == 6'd31) begin
+                            // 32位地址接收完成
+                            reg_addr <= {shift_in[29:0], mosi_data};  // 低31位是地址
+                            is_write <= shift_in[30];  // bit31 是读写标志
                             state    <= STATE_WAIT_DATA;
-                            bit_cnt  <= 3'd0;
+                            bit_cnt  <= 6'd0;
                         end
                     end
                 end
@@ -141,17 +142,17 @@ always @(posedge clk or negedge rst_n) begin
                     
                     // SCLK 上升沿采样 MOSI
                     if (sclk_rising) begin
-                        shift_in <= {shift_in[6:0], mosi_data};
-                        bit_cnt  <= bit_cnt + 1'b1;
+                        shift_in[7:0] <= {shift_in[6:0], mosi_data};
+                        bit_cnt <= bit_cnt + 1'b1;
                         
-                        if (bit_cnt == 3'd7) begin
+                        if (bit_cnt == 6'd7) begin
                             // 数据字节接收完成
                             if (is_write) begin
                                 reg_wr_data <= {shift_in[6:0], mosi_data};
                                 reg_wr_en   <= 1'b1;
                             end
                             state   <= STATE_DONE;
-                            bit_cnt <= 3'd0;
+                            bit_cnt <= 6'd0;
                         end
                     end
                 end

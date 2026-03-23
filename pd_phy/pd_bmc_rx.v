@@ -14,14 +14,21 @@ module pd_bmc_rx (
     
     // 接收完成包接口
     output reg  [15:0]        rx_header_o,
-    output wire [239:0]       rx_data_flat_o, // 【修复】展平的输出端口
+    output wire [239:0]       rx_data_flat_o,
     output reg  [4:0]         rx_data_len_o,
     output reg                rx_done_o,
     output reg                rx_busy_o,
     output reg                rx_error_o,
+    output reg                rx_crc_ok_o,     // CRC 验证结果
+    output reg  [2:0]         rx_msg_id_o,     // 接收到的 MessageID
     
     // 底层物理输入
-    input  wire               bmc_rx_pad
+    input  wire               bmc_rx_pad,
+    
+    // 调试接口 - 实时输出解析的byte
+    input  wire               dbg_en_i,        // 调试使能
+    output reg  [7:0]         dbg_byte_o,      // 当前解析的字节
+    output reg                dbg_byte_valid_o // 字节有效标志
 );
 
 //============================================================================
@@ -175,18 +182,25 @@ reg        byte_nibble_sel;
 reg [4:0]  current_symbol;
 reg [7:0]  current_byte;
 reg [15:0] rx_header_reg;
-reg [31:0] crc_reg;
+reg [31:0] crc_calc;         // 用于实时计算接收数据的 CRC
+reg [31:0] rx_crc_received;  // 接收到的 CRC 值
 
 // 【修复1】声明内部数据数组，用于暂存接收数据
 reg [7:0]  rx_data_reg [0:29];
 
 //============================================================================
-// 【修复2】添加：内部数组 -> 展平输出端口 的映射逻辑
+// 数据输出映射
+// rx_data_reg 布局: [0-1]:SOP, [2-3]:Header, [4...]:Data, [最后4字节]:CRC
+// rx_data_flat_o 输出实际数据部分 (从 rx_data_reg[4] 开始)
 //============================================================================
 genvar k;
 generate
-    for (k = 0; k < 30; k = k + 1) begin : gen_rx_data_map
-        assign rx_data_flat_o[k*8 +: 8] = rx_data_reg[k];
+    for (k = 0; k < 26; k = k + 1) begin : gen_rx_data_map
+        assign rx_data_flat_o[k*8 +: 8] = rx_data_reg[k + 4];
+    end
+    // 填充剩余位为 0
+    for (k = 26; k < 30; k = k + 1) begin : gen_rx_data_pad
+        assign rx_data_flat_o[k*8 +: 8] = 8'd0;
     end
 endgenerate
 
@@ -257,22 +271,27 @@ always @(posedge clk or negedge rst_n) begin
         current_symbol <= 5'd0;
         current_byte <= 8'd0;
         rx_header_reg <= 16'd0;
-        crc_reg <= 32'hFFFFFFFF;
         
         // 复位内部数组 rx_data_reg
         for (i = 0; i < 30; i = i + 1) begin
             rx_data_reg[i] <= 8'd0;
         end
+        
+        // 复位调试信号
+        dbg_byte_o <= 8'd0;
+        dbg_byte_valid_o <= 1'b0;
     end else begin
         rx_done_o <= 1'b0;
+        dbg_byte_valid_o <= 1'b0;  // 默认清除调试有效标志
         
         case (rx_state)
             ST_IDLE: begin
                 rx_busy_o <= 1'b0;
                 rx_error_o <= 1'b0;
+                rx_crc_ok_o <= 1'b0;
                 preamble_cnt <= 6'd0;
                 symbol_bit_cnt <= 3'd0;
-                crc_reg <= 32'hFFFFFFFF;
+                crc_calc <= 32'hFFFFFFFF;
                 
                 if (rx_en_i && any_edge) begin
                     rx_busy_o <= 1'b1;
@@ -281,7 +300,12 @@ always @(posedge clk or negedge rst_n) begin
             end
             
             ST_PREAMBLE: begin
-                if (rx_bit_valid) begin
+                // 如果 RX 被禁用，返回 IDLE
+                if (!rx_en_i) begin
+                    rx_busy_o <= 1'b0;
+                    rx_state <= ST_IDLE;
+                end
+                else if (rx_bit_valid) begin
                     preamble_cnt <= preamble_cnt + 1'b1;
                     
                     if (preamble_cnt == PREAMBLE_LEN - 1) begin
@@ -304,13 +328,26 @@ always @(posedge clk or negedge rst_n) begin
                         symbol_bit_cnt <= 3'd0;
                         // 检查是否是 EOP KCODE
                         if (current_symbol == KCODE_EOP) begin
-                            rx_data_len_o <= (byte_cnt > 2) ? (byte_cnt - 2) : 0;
+                            // 数据结构: SOP(2字节) + Header(2字节) + Data(N字节) + CRC(4字节)
+                            // byte_cnt = 2 + 2 + N + 4 = N + 8
+                            // 实际数据长度 N = byte_cnt - 8
+                            rx_data_len_o <= (byte_cnt > 8) ? (byte_cnt - 8) : 0;
                             rx_done_o <= 1'b1;
                             rx_busy_o <= 1'b0;
                             
                             if (byte_cnt >= 4) begin
-                                // 从内部数组 rx_data_reg 提取 Header
+                                // 提取 Header (SOP后的前2字节, 即 rx_data_reg[2-3])
                                 rx_header_o <= {rx_data_reg[3], rx_data_reg[2]};
+                                // rx_msg_id_o <= rx_data_reg[2][6:4];  // MessageID 在 Header 低字节 [14:12]
+                                
+                                rx_crc_received = {rx_data_reg[byte_cnt - 1],rx_data_reg[byte_cnt - 2],rx_data_reg[byte_cnt - 3],rx_data_reg[byte_cnt - 4]};
+                                for (i = 2; i < byte_cnt - 4; i = i + 1) begin
+                                    crc_calc = calc_crc32(crc_calc, rx_data_reg[i]);
+                                end
+                                crc_calc = ~crc_calc;
+                                rx_crc_ok_o = (crc_calc == rx_crc_received);
+                            end else begin
+                                $display("[RX CRC Debug] byte_cnt=%0d < 8, skipping CRC check", byte_cnt);
                             end
                             rx_state <= ST_DONE;
                         end else begin
@@ -320,6 +357,12 @@ always @(posedge clk or negedge rst_n) begin
                                 current_byte[7:4] = decode_4b5b_data(current_symbol);
                                 // 保存到内部数组 rx_data_reg
                                 rx_data_reg[byte_cnt] <= {decode_4b5b_data(current_symbol), current_byte[3:0]};
+                                
+                                // 调试输出 - 高字节时输出完整byte
+                                if (dbg_en_i) begin
+                                    dbg_byte_o <= {decode_4b5b_data(current_symbol), current_byte[3:0]};
+                                    dbg_byte_valid_o <= 1'b1;
+                                end
                                 
                                 byte_cnt <= byte_cnt + 1'b1;
                                 
@@ -337,8 +380,13 @@ always @(posedge clk or negedge rst_n) begin
             ST_DONE: begin
                 // 清除错误标志
                 rx_error_o <= 1'b0;
+                // 如果 rx_en 被禁用，返回 IDLE
+                if (!rx_en_i) begin
+                    rx_done_o <= 1'b0;
+                    rx_state <= ST_IDLE;
+                end
                 // 保持 rx_done_o 置位，直到检测到新的边沿（下一包开始）
-                if (any_edge) begin
+                else if (any_edge) begin
                     rx_done_o <= 1'b0;
                     rx_state <= ST_PREAMBLE;
                 end

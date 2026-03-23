@@ -283,6 +283,8 @@ always @(posedge clk or negedge rst_n) begin
                                     current_symbol <= encode_4b5b_data(~crc_next[3:0]);
                                     byte_nibble_sel <= 1'b0;
                                     crc_byte_cnt <= 2'd0;
+                                    $display("[TX CRC] crc_reg=%08h, crc_next=%08h, final_crc=%08h", 
+                                             crc_reg, crc_next, ~crc_next);
                                     tx_state <= ST_CRC;
                                 end
                             end

@@ -39,9 +39,8 @@ module dtest_phy (
     output wire        led_rx_err,
     output wire        led_heartbeat,
     
-    // BMC 物理接口
-    output wire        bmc_tx_pad,
-    input  wire        bmc_rx_pad
+    // BMC 物理接口 (TX/RX 共用一条线)
+    inout  wire        bmc_pad
 );
 
 //============================================================================
@@ -95,12 +94,21 @@ assign led_heartbeat = ~heartbeat_reg;
 
 //============================================================================
 // SPI 从机接口
+// 地址格式: [30:16]=模块ID, [15:0]=寄存器地址
 //============================================================================
-wire        reg_wr_en;
-wire        reg_rd_en;
-wire [7:0]  reg_addr;
-wire [7:0]  reg_wr_data;
-wire [7:0]  reg_rd_data;
+localparam MODULE_ID_PD   = 15'h0001;  // PD 模块
+localparam MODULE_ID_UFCS = 15'h0002;  // UFCS 模块 (预留)
+
+wire        spi_wr_en;
+wire        spi_rd_en;
+wire [30:0] spi_addr;      // 31位地址 (不含R/W位)
+wire [7:0]  spi_wr_data;
+reg  [7:0]  spi_rd_data;
+
+// 地址解码
+wire [14:0] module_id    = spi_addr[30:16];
+wire [15:0] module_addr  = spi_addr[15:0];
+wire        pd_selected  = (module_id == MODULE_ID_PD);
 
 spi_slave u_spi_slave (
     .clk         (clk_50m),
@@ -109,12 +117,27 @@ spi_slave u_spi_slave (
     .spi_cs_n    (spi_cs_n),
     .spi_mosi    (spi_mosi),
     .spi_miso    (spi_miso),
-    .reg_wr_en   (reg_wr_en),
-    .reg_rd_en   (reg_rd_en),
-    .reg_addr    (reg_addr),
-    .reg_wr_data (reg_wr_data),
-    .reg_rd_data (reg_rd_data)
+    .reg_wr_en   (spi_wr_en),
+    .reg_rd_en   (spi_rd_en),
+    .reg_addr    (spi_addr),
+    .reg_wr_data (spi_wr_data),
+    .reg_rd_data (spi_rd_data)
 );
+
+// PD 模块寄存器接口
+wire        pd_wr_en   = spi_wr_en && pd_selected;
+wire        pd_rd_en   = spi_rd_en && pd_selected;
+wire [7:0]  pd_addr    = module_addr[7:0];
+wire [7:0]  pd_rd_data;
+
+// 读数据多路选择 (根据模块ID选择)
+always @(*) begin
+    case (module_id)
+        MODULE_ID_PD:   spi_rd_data = pd_rd_data;
+        // MODULE_ID_UFCS: spi_rd_data = ufcs_rd_data;  // 预留
+        default:        spi_rd_data = 8'h00;
+    endcase
+end
 
 //============================================================================
 // PD PHY 信号
@@ -133,24 +156,32 @@ wire [4:0]   rx_data_len;
 wire         rx_done;
 wire         rx_busy;
 wire         rx_error;
+wire         rx_crc_ok;
 wire         rx_en;
 
+// 协议配置信号
+wire [2:0]   msg_id;
+wire         auto_goodcrc;
+wire         loopback_mode;
+wire         tx_fail;
+
 //============================================================================
-// 寄存器接口
+// PD PHY 寄存器接口
 //============================================================================
 pd_phy_regs u_pd_phy_regs (
     .clk          (clk_50m),
     .rst_n        (rst_n),
-    .reg_wr_en    (reg_wr_en),
-    .reg_rd_en    (reg_rd_en),
-    .reg_addr     (reg_addr),
-    .reg_wr_data  (reg_wr_data),
-    .reg_rd_data  (reg_rd_data),
+    .reg_wr_en    (pd_wr_en),
+    .reg_rd_en    (pd_rd_en),
+    .reg_addr     (pd_addr),
+    .reg_wr_data  (spi_wr_data),
+    .reg_rd_data  (pd_rd_data),
     .tx_header    (tx_header),
     .tx_data_flat (tx_data_flat),
     .tx_data_len  (tx_data_len),
     .tx_start     (tx_start),
     .tx_done      (tx_done),
+    .tx_fail      (tx_fail),
     .tx_busy      (tx_busy),
     .rx_header    (rx_header),
     .rx_data_flat (rx_data_flat),
@@ -158,7 +189,11 @@ pd_phy_regs u_pd_phy_regs (
     .rx_done      (rx_done),
     .rx_busy      (rx_busy),
     .rx_error     (rx_error),
+    .rx_crc_ok    (rx_crc_ok),
     .rx_en        (rx_en),
+    .msg_id       (msg_id),
+    .auto_goodcrc (auto_goodcrc),
+    .loopback_mode(loopback_mode),
     .irq_n        (irq_n)
 );
 
@@ -168,8 +203,10 @@ assign led_rx_ok  = ~rx_done;
 assign led_rx_err = ~rx_error;
 
 //============================================================================
-// PD BMC 收发器
+// PD BMC 收发器 (TX/RX 互斥，半双工)
 //============================================================================
+wire bmc_pad_en;        // TX 输出使能
+
 pd_bmc_transceiver u_pd_bmc_transceiver (
     .clk            (clk_50m),
     .rst_n          (rst_n),
@@ -179,6 +216,7 @@ pd_bmc_transceiver u_pd_bmc_transceiver (
     .tx_data_len_i  (tx_data_len),
     .tx_start_i     (tx_start),
     .tx_done_o      (tx_done),
+    .tx_fail_o      (tx_fail),
     .tx_busy_o      (tx_busy),
     .tx_active_o    (tx_active),
     // RX 接口
@@ -188,10 +226,15 @@ pd_bmc_transceiver u_pd_bmc_transceiver (
     .rx_done_o      (rx_done),
     .rx_busy_o      (rx_busy),
     .rx_error_o     (rx_error),
+    .rx_crc_ok_o    (rx_crc_ok),
     .rx_en_i        (rx_en),
-    // BMC 接口
-    .bmc_tx_pad     (bmc_tx_pad),
-    .bmc_rx_pad     (bmc_rx_pad)
+    // 协议配置
+    .msg_id_i       (msg_id),
+    .auto_goodcrc_i (auto_goodcrc),
+    .loopback_mode_i(loopback_mode),
+    // BMC 接口 (TX/RX 共用一条线)
+    .bmc_pad        (bmc_pad),
+    .bmc_pad_en     (bmc_pad_en)
 );
 
 endmodule
