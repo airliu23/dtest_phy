@@ -163,6 +163,7 @@ wire         rx_en;
 wire [2:0]   msg_id;
 wire         auto_goodcrc;
 wire         loopback_mode;
+wire [7:0]   header_good_crc;  // GoodCRC配置 [0]:PowerRole [1]:DataRole [2]:CablePlug [3]:CableRole
 wire         tx_fail;
 
 //============================================================================
@@ -194,6 +195,7 @@ pd_phy_regs u_pd_phy_regs (
     .msg_id       (msg_id),
     .auto_goodcrc (auto_goodcrc),
     .loopback_mode(loopback_mode),
+    .header_good_crc (header_good_crc),  // GoodCRC配置
     .irq_n        (irq_n)
 );
 
@@ -232,6 +234,7 @@ pd_bmc_transceiver u_pd_bmc_transceiver (
     .msg_id_i       (msg_id),
     .auto_goodcrc_i (auto_goodcrc),
     .loopback_mode_i(loopback_mode),
+    .header_good_crc (header_good_crc),  // GoodCRC配置
     // BMC 接口 (TX/RX 共用一条线)
     .bmc_pad        (bmc_pad),
     .bmc_pad_en     (bmc_pad_en)

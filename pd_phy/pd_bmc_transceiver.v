@@ -34,6 +34,7 @@ module pd_bmc_transceiver (
     input  wire         rx_en_i,
     
     // 配置接口
+    input  wire [7:0]   header_good_crc,  // bit0 -> power role; bit1 -> data_role; bit2 -> cable_role;
     input  wire [2:0]   msg_id_i,
     input  wire         auto_goodcrc_i,   // 启用自动 GoodCRC 握手
     input  wire         loopback_mode_i,
@@ -269,8 +270,13 @@ always @(posedge clk or negedge rst_n) begin
                     
                     if (rx_crc_ok_o && auto_goodcrc_i && !rx_is_goodcrc) begin
                         // CRC 正确且不是 GoodCRC 消息，需要发送 ACK
-                        // 构建 GoodCRC Header：使用接收到的 MessageID
-                        ack_header <= GOODCRC_HEADER_BASE | (rx_header_o[4:0] & 5'h1F);  // 复制 MsgID
+                        // 构建 GoodCRC Header
+                        // [11:9]=MsgID, [8]=PortRole, [7:6]=SpecRev, [5]=DataRole, [4:0]=MsgTYPE
+                        ack_header <= GOODCRC_HEADER_BASE |           // Type=GoodCRC
+                                      (header_good_crc[0] << 8) |   // [9:8]=PowerRole from header_good_crc[0]
+                                      (rx_header_o[7:6] << 6) |       // [7:6]=SpecRev from received header
+                                      (header_good_crc[1] << 5) |     // [5]= DataRole from header_good_crc[1]
+                                      (rx_header_o[11:9] << 9);             // [11:9]=MsgID from received header
                         ack_data_flat <= 240'd0;
                         ack_data_len <= 5'd0;
                         goodcrc_delay_cnt <= 13'd0;  // 初始化延时计数器

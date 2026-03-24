@@ -11,6 +11,7 @@
 // 0x05       IRQ_EN      中断使能 [0]:TX_DONE_IE [1]:TX_FAIL_IE [2]:RX_DONE_IE [3]:RX_ERR_IE
 // 0x06       IRQ_FLAG    中断标志 (劙1清除) [0]:TX_DONE_IF [1]:TX_FAIL_IF [2]:RX_DONE_IF [3]:RX_ERR_IF
 // 0x07       MSG_ID      消息ID [2:0]:MSG_ID
+// 0x08       GOODCRC_CFG GoodCRC配置 [0]:PowerRole [1]:DataRole [2]:CablePlug [3]:CableRole
 // 0x10-0x2D  TX_DATA     发送数据缓冲区 (30 字节)
 // 0x40       RX_HDR_L    接收 Header 低字节 (只读)
 // 0x41       RX_HDR_H    接收 Header 高字节 (只读)
@@ -54,6 +55,7 @@ module pd_phy_regs (
     output reg  [2:0]   msg_id,
     output reg          auto_goodcrc,
     output reg          loopback_mode,
+    output reg  [7:0]   header_good_crc,  // GoodCRC配置 [0]:PowerRole [1]:DataRole [2]:CablePlug [3]:CableRole
     
     // 中断输出
     output wire         irq_n
@@ -70,6 +72,7 @@ localparam ADDR_TX_LEN   = 8'h04;
 localparam ADDR_IRQ_EN   = 8'h05;
 localparam ADDR_IRQ_FLAG = 8'h06;
 localparam ADDR_MSG_ID   = 8'h07;
+localparam ADDR_GOODCRC_CFG = 8'h08;  // GoodCRC配置寄存器
 localparam ADDR_TX_DATA  = 8'h10;  // 0x10 - 0x2D
 localparam ADDR_RX_HDR_L = 8'h40;
 localparam ADDR_RX_HDR_H = 8'h41;
@@ -157,6 +160,7 @@ always @(posedge clk or negedge rst_n) begin
         msg_id       <= 3'd0;
         auto_goodcrc <= 1'b1;  // 默认启用自动 GoodCRC
         loopback_mode <= 1'b0;
+        header_good_crc <= 8'h00;  // 默认GoodCRC配置
     end else begin
         // 默认清除 tx_start (单周期脉冲)
         tx_start <= 1'b0;
@@ -175,6 +179,7 @@ always @(posedge clk or negedge rst_n) begin
                 ADDR_TX_LEN:   tx_data_len     <= reg_wr_data[4:0];
                 ADDR_IRQ_EN:   irq_en_reg      <= reg_wr_data;
                 ADDR_MSG_ID:   msg_id          <= reg_wr_data[2:0];
+                ADDR_GOODCRC_CFG: header_good_crc <= reg_wr_data;  // GoodCRC配置
                 
                 default: begin
                     // TX_DATA 区域 (0x10 - 0x2D)
@@ -235,6 +240,7 @@ always @(*) begin
         ADDR_IRQ_EN:   reg_rd_data = irq_en_reg;
         ADDR_IRQ_FLAG: reg_rd_data = irq_flag_reg;
         ADDR_MSG_ID:   reg_rd_data = {5'b0, msg_id};
+        ADDR_GOODCRC_CFG: reg_rd_data = header_good_crc;  // GoodCRC配置
         ADDR_RX_HDR_L: reg_rd_data = rx_header[7:0];
         ADDR_RX_HDR_H: reg_rd_data = rx_header[15:8];
         ADDR_RX_LEN:   reg_rd_data = {3'b0, rx_data_len};
