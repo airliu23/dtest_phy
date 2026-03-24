@@ -29,7 +29,9 @@ TOP_SRCS = dtest_phy.v spi_slave.v pd_phy_regs.v
 # PD PHY 子模块 (纯 PD 功能)
 PHY_SRCS = $(PD_PHY_DIR)/pd_bmc_tx.v \
            $(PD_PHY_DIR)/pd_bmc_rx.v \
-           $(PD_PHY_DIR)/pd_bmc_transceiver.v
+           $(PD_PHY_DIR)/pd_bmc_transceiver.v \
+           $(PD_PHY_DIR)/cc.v \
+           $(PD_PHY_DIR)/pd_phy.v
 
 # 所有源文件
 SRCS = $(TOP_SRCS) $(PHY_SRCS)
@@ -37,6 +39,7 @@ SRCS = $(TOP_SRCS) $(PHY_SRCS)
 # 测试平台
 TB_PHY = $(PD_PHY_DIR)/pd_bmc_tb.v
 TB_TOP = dtest_phy_tb.v
+TB_PD_PHY = $(PD_PHY_DIR)/pd_phy_tb.v  # PD PHY 模块专用测试 (CC/VBUS)
 # TB_AB = dtest_phy_ab_tb.v
 
 # 默认测试平台 (顶层)
@@ -73,9 +76,29 @@ DEFINES =
 .PHONY: all
 all: compile simulate
 
+# PD PHY 模块测试
+.PHONY: pd-phy-test
+pd-phy-test: compile-pd-phy simulate-pd-phy
+
 # A->B 通信测试
 .PHONY: ab-test
 ab-test: compile-ab simulate-ab
+
+.PHONY: compile-pd-phy
+compile-pd-phy:
+	@echo "========================================"
+	@echo "编译 PD PHY 模块测试..."
+	@echo "========================================"
+	$(IVERILOG) $(IVERILOG_FLAGS) $(DEFINES) -o pd_phy_tb.sim $(SRCS) $(TB_PD_PHY)
+	@echo "编译完成！输出文件：pd_phy_tb.sim"
+
+.PHONY: simulate-pd-phy
+simulate-pd-phy:
+	@echo "========================================"
+	@echo "运行 PD PHY 模块测试..."
+	@echo "========================================"
+	$(VVP) pd_phy_tb.sim
+	@echo "仿真完成！波形文件：pd_phy_tb.vcd"
 
 .PHONY: compile-ab
 compile-ab:
@@ -136,6 +159,7 @@ clean:
 	@echo "清理生成的文件..."
 	rm -f $(SIM_OUTPUT) $(WAVEFORM) $(WAVEFORM).bak
 	rm -f dtest_phy_ab.sim dtest_phy_ab_tb.vcd
+	rm -f pd_phy_tb.sim pd_phy_tb.vcd
 	rm -f $(SYNTH_OUTPUT) $(RTLIL_OUTPUT)
 	@echo "清理完成"
 
@@ -191,19 +215,20 @@ help:
 	@echo "========================================"
 	@echo ""
 	@echo "主要目标:"
-	@echo "  all       - 编译并运行仿真 (默认)"
-	@echo "  ab-test   - 运行 A->B 通信测试"
-	@echo "  compile   - 仅编译，不运行仿真"
-	@echo "  simulate  - 运行仿真（需要先编译）"
-	@echo "  rebuild   - 重新编译"
-	@echo "  wave      - 打开 GTKWave 查看波形"
-	@echo "  clean     - 清理生成的文件"
-	@echo "  lint      - 语法检查"
-	@echo "  help      - 显示此帮助信息"
+	@echo "  all         - 编译并运行仿真 (默认)"
+	@echo "  pd-phy-test - 运行 PD PHY CC/VBUS 模块测试"
+	@echo "  ab-test     - 运行 A->B 通信测试"
+	@echo "  compile     - 仅编译，不运行仿真"
+	@echo "  simulate    - 运行仿真（需要先编译）"
+	@echo "  rebuild     - 重新编译"
+	@echo "  wave        - 打开 GTKWave 查看波形"
+	@echo "  clean       - 清理生成的文件"
+	@echo "  lint        - 语法检查"
+	@echo "  help        - 显示此帮助信息"
 	@echo ""
 	@echo "高级目标 (需要 Yosys):"
-	@echo "  synth     - RTL 综合"
-	@echo "  rtlil     - 生成 RTLIL 格式"
+	@echo "  synth       - RTL 综合"
+	@echo "  rtlil       - 生成 RTLIL 格式"
 	@echo ""
 	@echo "变量:"
 	@echo "  SIM_OUTPUT = $(SIM_OUTPUT)"
@@ -211,6 +236,7 @@ help:
 	@echo ""
 	@echo "示例用法:"
 	@echo "  make                    # 编译并运行仿真"
+	@echo "  make pd-phy-test        # 运行 PD PHY CC/VBUS 测试"
 	@echo "  make ab-test            # 运行 A->B 通信测试"
 	@echo "  make wave               # 打开波形查看器"
 	@echo "  make DEFINES=-PCLK_FREQ_MHZ=100  # 使用不同时钟频率编译"

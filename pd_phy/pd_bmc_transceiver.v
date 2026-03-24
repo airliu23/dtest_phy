@@ -372,7 +372,10 @@ pd_bmc_rx u_pd_bmc_rx (
     .rx_crc_ok_o    (rx_crc_ok_o),
     .rx_msg_id_o    (),
     .bmc_rx_pad     (bmc_pad),        // RX 从 BMC 线读取
-    .rx_en_i        (rx_actual_en)
+    .rx_en_i        (rx_actual_en),
+    .dbg_en_i       (1'b0),           // 调试接口禁用
+    .dbg_byte_o     (),
+    .dbg_byte_valid_o ()
 );
 
 endmodule
