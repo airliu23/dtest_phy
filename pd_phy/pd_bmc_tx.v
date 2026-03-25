@@ -283,8 +283,6 @@ always @(posedge clk or negedge rst_n) begin
                                     current_symbol <= encode_4b5b_data(~crc_next[3:0]);
                                     byte_nibble_sel <= 1'b0;
                                     crc_byte_cnt <= 2'd0;
-                                    $display("[TX CRC] crc_reg=%08h, crc_next=%08h, final_crc=%08h", 
-                                             crc_reg, crc_next, ~crc_next);
                                     tx_state <= ST_CRC;
                                 end
                             end
@@ -415,7 +413,9 @@ always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         bmc_state  <= 1'b1;
         bmc_tx_pad <= 1'b1;
-    end else if (tx_state == ST_IDLE) begin
+    end else if (tx_state == ST_IDLE || tx_state == ST_DONE) begin
+        // 空闲和完成状态：保持高电平，复位 bmc_state
+        bmc_state  <= 1'b1;
         bmc_tx_pad <= 1'b1;
     end else if (tx_state == ST_LOW) begin
         bmc_state  <= 1'b0;

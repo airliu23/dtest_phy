@@ -34,13 +34,30 @@ module dtest_phy (
     output wire        irq_n,
     
     // LED 指示
-    output wire        led_tx,
-    output wire        led_rx_ok,
-    output wire        led_rx_err,
     output wire        led_heartbeat,
     
-    // BMC 物理接口 (TX/RX 共用一条线)
-    inout  wire        bmc_pad
+    // BMC 物理接口 (分离输入输出)
+    input  wire        bmc_rx,        // BMC 接收输入
+    output wire        bmc_tx,        // BMC 发送输出
+    output wire        bmc_tx_en,     // BMC 发送使能
+    
+    // CC 状态输入 (来自外部 ADC/比较器)
+    input  wire [2:0]  cc1_state_i,
+    input  wire [2:0]  cc2_state_i,
+    
+    // CC 模式输出 (到外部模拟开关)
+    output wire [2:0]  cc1_mode_o,
+    output wire [2:0]  cc2_mode_o,
+    
+    // 插头方向输出 (控制外部信号)
+    output wire        plug_orient_o,
+    
+    // I2C 从机接口 (地址 0x28)
+    input  wire        i2c_scl,
+    inout  wire        i2c_sda,
+    
+    // 调试输出
+    output wire        dbg_toggle_o      // RX 每收到有效数据位翻转一次
 );
 
 //============================================================================
@@ -124,11 +141,41 @@ spi_slave u_spi_slave (
     .reg_rd_data (spi_rd_data)
 );
 
-// PD 模块寄存器接口
-wire        pd_wr_en   = spi_wr_en && pd_selected;
-wire        pd_rd_en   = spi_rd_en && pd_selected;
-wire [7:0]  pd_addr    = module_addr[7:0];
+// PD 模块寄存器接口 (SPI)
+wire        spi_pd_wr_en = spi_wr_en && pd_selected;
+wire        spi_pd_rd_en = spi_rd_en && pd_selected;
+wire [7:0]  spi_pd_addr  = module_addr[7:0];
 wire [7:0]  pd_rd_data;
+
+//============================================================================
+// I2C 从机接口 (地址 0x28)
+//============================================================================
+wire        i2c_wr_en;
+wire        i2c_rd_en;
+wire [7:0]  i2c_addr;
+wire [7:0]  i2c_wr_data;
+
+i2c_slave #(
+    .SLAVE_ADDR(7'h28)
+) u_i2c_slave (
+    .clk         (clk_50m),
+    .rst_n       (rst_n),
+    .i2c_scl     (i2c_scl),
+    .i2c_sda     (i2c_sda),
+    .reg_wr_en   (i2c_wr_en),
+    .reg_rd_en   (i2c_rd_en),
+    .reg_addr    (i2c_addr),
+    .reg_wr_data (i2c_wr_data),
+    .reg_rd_data (pd_rd_data)
+);
+
+// 合并 SPI 和 I2C 的寄存器访问 (SPI 优先)
+wire        pd_wr_en = spi_pd_wr_en || i2c_wr_en;
+wire        pd_rd_en = spi_pd_rd_en || i2c_rd_en;
+wire [7:0]  pd_addr  = spi_pd_wr_en ? spi_pd_addr :
+                       spi_pd_rd_en ? spi_pd_addr :
+                       i2c_addr;
+wire [7:0]  pd_wr_data_mux = spi_pd_wr_en ? spi_wr_data : i2c_wr_data;
 
 // 读数据多路选择 (根据模块ID选择)
 always @(*) begin
@@ -146,25 +193,35 @@ wire [15:0]  tx_header;
 wire [239:0] tx_data_flat;
 wire [4:0]   tx_data_len;
 wire         tx_start;
-wire         tx_done;
-wire         tx_busy;
-wire         tx_active;
+wire         tx_success;  // 发送成功
+wire         tx_fail;     // 发送失败
 
 wire [15:0]  rx_header;
 wire [239:0] rx_data_flat;
 wire [4:0]   rx_data_len;
-wire         rx_done;
-wire         rx_busy;
-wire         rx_error;
-wire         rx_crc_ok;
-wire         rx_en;
+wire         rx_success;  // 接收成功
+wire         rx_en;       // RX 使能控制
 
 // 协议配置信号
-wire [2:0]   msg_id;
-wire         auto_goodcrc;
-wire         loopback_mode;
 wire [7:0]   header_good_crc;  // GoodCRC配置 [0]:PowerRole [1]:DataRole [2]:CablePlug [3]:CableRole
-wire         tx_fail;
+
+// CC 配置信号
+wire [1:0]   cc1_mode;
+wire [1:0]   cc2_mode;
+wire [1:0]   rp_level;
+wire         drp_mode;
+wire         plug_orient;
+wire [2:0]   cc1_debounced;
+wire [2:0]   cc2_debounced;
+wire         cc_changed;
+wire         plug_orient_out;  // pd_phy 输出的插头方向
+
+// RX 调试信号
+wire [2:0]   dbg_rx_state;      // RX 状态机 (transceiver 层)
+wire         dbg_toggle;        // 每收到有效数据位翻转
+
+assign plug_orient_o = plug_orient_out;
+assign dbg_toggle_o = dbg_toggle;
 
 //============================================================================
 // PD PHY 寄存器接口
@@ -175,69 +232,90 @@ pd_phy_regs u_pd_phy_regs (
     .reg_wr_en    (pd_wr_en),
     .reg_rd_en    (pd_rd_en),
     .reg_addr     (pd_addr),
-    .reg_wr_data  (spi_wr_data),
+    .reg_wr_data  (pd_wr_data_mux),
     .reg_rd_data  (pd_rd_data),
     .tx_header    (tx_header),
     .tx_data_flat (tx_data_flat),
     .tx_data_len  (tx_data_len),
     .tx_start     (tx_start),
-    .tx_done      (tx_done),
+    .tx_success   (tx_success),
     .tx_fail      (tx_fail),
-    .tx_busy      (tx_busy),
     .rx_header    (rx_header),
     .rx_data_flat (rx_data_flat),
     .rx_data_len  (rx_data_len),
-    .rx_done      (rx_done),
-    .rx_busy      (rx_busy),
-    .rx_error     (rx_error),
-    .rx_crc_ok    (rx_crc_ok),
+    .rx_success   (rx_success),
     .rx_en        (rx_en),
-    .msg_id       (msg_id),
-    .auto_goodcrc (auto_goodcrc),
-    .loopback_mode(loopback_mode),
-    .header_good_crc (header_good_crc),  // GoodCRC配置
+    .header_good_crc (header_good_crc),
+    // CC 接口
+    .cc1_mode     (cc1_mode),
+    .cc2_mode     (cc2_mode),
+    .rp_level     (rp_level),
+    .drp_mode     (drp_mode),
+    .plug_orient  (plug_orient),
+    .cc1_state    (cc1_debounced),
+    .cc2_state    (cc2_debounced),
+    .cc1_mode_out (cc1_mode_o),
+    .cc2_mode_out (cc2_mode_o),
+    .cc_changed   (cc_changed),
+    // RX 调试接口
+    .dbg_rx_state     (dbg_rx_state),
     .irq_n        (irq_n)
 );
 
-// LED 控制 (低电平点亮)
-assign led_tx     = ~tx_busy;
-assign led_rx_ok  = ~rx_done;
-assign led_rx_err = ~rx_error;
-
 //============================================================================
-// PD BMC 收发器 (TX/RX 互斥，半双工)
+// PD PHY 模块 (包含 CC 检测和 BMC 收发器)
 //============================================================================
-wire bmc_pad_en;        // TX 输出使能
+wire bmc_tx_internal;   // 内部 TX 输出
+wire bmc_tx_en_internal; // 内部 TX 使能
 
-pd_bmc_transceiver u_pd_bmc_transceiver (
+assign bmc_tx = bmc_tx_internal;
+assign bmc_tx_en = bmc_tx_en_internal;
+
+pd_phy u_pd_phy (
     .clk            (clk_50m),
     .rst_n          (rst_n),
+    
+    // CC 接口
+    .cc1_state_i    (cc1_state_i),
+    .cc2_state_i    (cc2_state_i),
+    .cc1_mode_i     (cc1_mode),
+    .cc2_mode_i     (cc2_mode),
+    .rp_level_i     (rp_level),
+    .drp_mode_i     (drp_mode),
+    .cc1_mode_o     (cc1_mode_o),
+    .cc2_mode_o     (cc2_mode_o),
+    .cc1_debounced_o(cc1_debounced),
+    .cc2_debounced_o(cc2_debounced),
+    .cc_changed_o   (cc_changed),
+    .plug_orient_i  (plug_orient),
+    .plug_orient_o  (plug_orient_out),
+    
     // TX 接口
     .tx_header_i    (tx_header),
     .tx_data_flat_i (tx_data_flat),
     .tx_data_len_i  (tx_data_len),
     .tx_start_i     (tx_start),
-    .tx_done_o      (tx_done),
+    .tx_success_o   (tx_success),
     .tx_fail_o      (tx_fail),
-    .tx_busy_o      (tx_busy),
-    .tx_active_o    (tx_active),
+    
     // RX 接口
     .rx_header_o    (rx_header),
     .rx_data_flat_o (rx_data_flat),
     .rx_data_len_o  (rx_data_len),
-    .rx_done_o      (rx_done),
-    .rx_busy_o      (rx_busy),
-    .rx_error_o     (rx_error),
-    .rx_crc_ok_o    (rx_crc_ok),
+    .rx_success_o   (rx_success),
     .rx_en_i        (rx_en),
+    
     // 协议配置
-    .msg_id_i       (msg_id),
-    .auto_goodcrc_i (auto_goodcrc),
-    .loopback_mode_i(loopback_mode),
-    .header_good_crc (header_good_crc),  // GoodCRC配置
-    // BMC 接口 (TX/RX 共用一条线)
-    .bmc_pad        (bmc_pad),
-    .bmc_pad_en     (bmc_pad_en)
+    .header_good_crc(header_good_crc),
+    
+    // BMC 接口
+    .bmc_rx         (bmc_rx),
+    .bmc_tx         (bmc_tx_internal),
+    .bmc_tx_en      (bmc_tx_en_internal),
+    
+    // 调试接口
+    .dbg_rx_state_o     (dbg_rx_state),
+    .dbg_toggle_o       (dbg_toggle)
 );
 
 endmodule

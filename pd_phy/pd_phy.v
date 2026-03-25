@@ -16,9 +16,10 @@ module pd_phy (
     input  wire [2:0]  cc1_state_i,     // CC1 电压状态 (5种)
     input  wire [2:0]  cc2_state_i,     // CC2 电压状态 (5种)
     
-    // CC 模式配置输入
-    input  wire [2:0]  cc1_mode_i,      // CC1 模式配置 (6种)
-    input  wire [2:0]  cc2_mode_i,      // CC2 模式配置 (6种)
+    // CC 模式配置输入 (2-bit 模式 + 2-bit Rp电流)
+    input  wire [1:0]  cc1_mode_i,      // CC1 模式: 00=Open, 01=Rd, 10=Ra, 11=Rp
+    input  wire [1:0]  cc2_mode_i,      // CC2 模式: 00=Open, 01=Rd, 10=Ra, 11=Rp
+    input  wire [1:0]  rp_level_i,      // Rp 电流: 00=0.5A, 01=1.5A, 10=3A
     input  wire        drp_mode_i,      // DRP 模式使能
     
     // CC 控制输出 (到外部模拟开关/电阻网络)
@@ -31,12 +32,8 @@ module pd_phy (
     
     // CC 连接中断 (DRP切换过程中不触发)
     output wire        cc_changed_o,    // CC 变化中断
-    
-    //============================================================================
-    // VBUS 接口
-    //============================================================================
-    input  wire [1:0]  vbus_state_i,    // VBUS 电压状态 (3种)
-    output wire [1:0]  vbus_debounced_o,// 消抖后的 VBUS 状态
+    input  wire        plug_orient_i,   // 插头方向: 0=CC1通信, 1=CC2通信 (外部控制)
+    output wire        plug_orient_o,
     
     //============================================================================
     // BMC 收发器接口
@@ -46,31 +43,39 @@ module pd_phy (
     input  wire [239:0] tx_data_flat_i,
     input  wire [4:0]  tx_data_len_i,
     input  wire        tx_start_i,
-    output wire        tx_done_o,
-    output wire        tx_busy_o,
-    output wire        tx_active_o,
+    output wire        tx_success_o,    // 发送成功（收到 GoodCRC）
+    output wire        tx_fail_o,       // 发送失败（超时）
     
     // RX 接口
     output wire [15:0] rx_header_o,
     output wire [239:0] rx_data_flat_o,
     output wire [4:0]  rx_data_len_o,
-    output wire        rx_done_o,
-    output wire        rx_busy_o,
-    output wire        rx_error_o,
-    output wire        rx_crc_ok_o,
-    input  wire        rx_en_i,
+    output wire        rx_success_o,    // 接收成功（回复 GoodCRC 完成）
+    input  wire        rx_en_i,         // RX 使能控制
     
     // 配置接口
     input  wire [7:0]  header_good_crc, // GoodCRC 配置
-    input  wire [2:0]  msg_id_i,
-    input  wire        auto_goodcrc_i,
-    input  wire        loopback_mode_i,
-    output wire        tx_fail_o,
     
-    // BMC 物理接口
-    inout  wire        bmc_pad,
-    output wire        bmc_pad_en
+    // BMC 物理接口 (分离输入输出)
+    input  wire        bmc_rx,       // BMC 接收输入
+    output wire        bmc_tx,       // BMC 发送输出
+    output wire        bmc_tx_en,    // BMC 发送使能
+    
+    // RX 调试接口
+    output wire [2:0]  dbg_rx_state_o,     // RX 状态机 (transceiver 层)
+    output wire        dbg_toggle_o        // 每收到有效数据位翻转
 );
+
+// 内部 BMC 信号
+wire bmc_tx_pad;  // TX 输出
+wire bmc_rx_pad;  // RX 输入
+
+// BMC 接口连接
+assign bmc_rx_pad = bmc_rx;
+assign bmc_tx = bmc_tx_pad;
+
+// 插头方向输出 (直通)
+assign plug_orient_o = plug_orient_i;
 
 //============================================================================
 // CC 模块实例化
@@ -88,13 +93,10 @@ cc u_cc (
     .cc2_debounced_o    (cc2_debounced_o),
     .cc_changed_o       (cc_changed_o),
     
-    // VBUS
-    .vbus_state_i       (vbus_state_i),
-    .vbus_debounced_o   (vbus_debounced_o),
-    
     // 配置
     .cc1_mode_i         (cc1_mode_i),
     .cc2_mode_i         (cc2_mode_i),
+    .rp_level_i         (rp_level_i),
     .drp_mode_i         (drp_mode_i),
     
     // 控制输出
@@ -114,30 +116,27 @@ pd_bmc_transceiver u_bmc_transceiver (
     .tx_data_flat_i (tx_data_flat_i),
     .tx_data_len_i  (tx_data_len_i),
     .tx_start_i     (tx_start_i),
-    .tx_done_o      (tx_done_o),
-    .tx_busy_o      (tx_busy_o),
-    .tx_active_o    (tx_active_o),
+    .tx_success_o   (tx_success_o),
+    .tx_fail_o      (tx_fail_o),
     
     // RX 接口
     .rx_header_o    (rx_header_o),
     .rx_data_flat_o (rx_data_flat_o),
     .rx_data_len_o  (rx_data_len_o),
-    .rx_done_o      (rx_done_o),
-    .rx_busy_o      (rx_busy_o),
-    .rx_error_o     (rx_error_o),
-    .rx_crc_ok_o    (rx_crc_ok_o),
+    .rx_success_o   (rx_success_o),
     .rx_en_i        (rx_en_i),
     
     // 配置接口
     .header_good_crc (header_good_crc),
-    .msg_id_i       (msg_id_i),
-    .auto_goodcrc_i (auto_goodcrc_i),
-    .loopback_mode_i(loopback_mode_i),
-    .tx_fail_o      (tx_fail_o),
     
     // BMC 物理接口
-    .bmc_pad        (bmc_pad),
-    .bmc_pad_en     (bmc_pad_en)
+    .bmc_rx_pad     (bmc_rx_pad),
+    .bmc_tx_pad     (bmc_tx_pad),
+    .bmc_tx_en      (bmc_tx_en),
+    
+    // 调试接口
+    .dbg_rx_state_o     (dbg_rx_state_o),
+    .dbg_toggle_o       (dbg_toggle_o)
 );
 
 endmodule

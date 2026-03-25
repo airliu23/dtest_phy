@@ -24,7 +24,7 @@ GTKWAVE = gtkwave
 PD_PHY_DIR = pd_phy
 
 # 顶层源文件
-TOP_SRCS = dtest_phy.v spi_slave.v pd_phy_regs.v
+TOP_SRCS = dtest_phy.v spi_slave.v i2c_slave.v pd_phy_regs.v
 
 # PD PHY 子模块 (纯 PD 功能)
 PHY_SRCS = $(PD_PHY_DIR)/pd_bmc_tx.v \

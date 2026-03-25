@@ -28,7 +28,10 @@ module pd_bmc_rx (
     // 调试接口 - 实时输出解析的byte
     input  wire               dbg_en_i,        // 调试使能
     output reg  [7:0]         dbg_byte_o,      // 当前解析的字节
-    output reg                dbg_byte_valid_o // 字节有效标志
+    output reg                dbg_byte_valid_o, // 字节有效标志
+    
+    // RX 调试输出
+    output reg                dbg_toggle_o        // 每收到有效数据位翻转一次
 );
 
 //============================================================================
@@ -167,6 +170,15 @@ always @(posedge clk or negedge rst_n) begin
     end
 end
 
+// 调试翻转信号 - 每收到有效数据位翻转一次
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        dbg_toggle_o <= 1'b0;
+    end else if (rx_bit_valid) begin
+        dbg_toggle_o <= ~dbg_toggle_o;
+    end
+end
+
 //============================================================================
 // 接收状态机
 //============================================================================
@@ -292,8 +304,14 @@ always @(posedge clk or negedge rst_n) begin
                 preamble_cnt <= 6'd0;
                 symbol_bit_cnt <= 3'd0;
                 crc_calc <= 32'hFFFFFFFF;
+                // 添加更完整的状态清除
+                byte_cnt <= 5'd0;
+                byte_nibble_sel <= 1'b0;
+                current_symbol <= 5'd0;
                 
-                if (rx_en_i && any_edge) begin
+                // 只在检测到下降沿（从高到低）时开始接收
+                // USB PD preamble 的第一个边沿是从空闲高电平到低电平
+                if (rx_en_i && prev_bmc_val && !bmc_rx_synced) begin
                     rx_busy_o <= 1'b1;
                     rx_state <= ST_PREAMBLE;
                 end
@@ -329,8 +347,6 @@ always @(posedge clk or negedge rst_n) begin
                         // 检查是否是 EOP KCODE
                         if (current_symbol == KCODE_EOP) begin
                             // 数据结构: SOP(2字节) + Header(2字节) + Data(N字节) + CRC(4字节)
-                            // byte_cnt = 2 + 2 + N + 4 = N + 8
-                            // 实际数据长度 N = byte_cnt - 8
                             rx_data_len_o <= (byte_cnt > 8) ? (byte_cnt - 8) : 0;
                             rx_done_o <= 1'b1;
                             rx_busy_o <= 1'b0;
@@ -341,13 +357,16 @@ always @(posedge clk or negedge rst_n) begin
                                 // rx_msg_id_o <= rx_data_reg[2][6:4];  // MessageID 在 Header 低字节 [14:12]
                                 
                                 rx_crc_received = {rx_data_reg[byte_cnt - 1],rx_data_reg[byte_cnt - 2],rx_data_reg[byte_cnt - 3],rx_data_reg[byte_cnt - 4]};
-                                for (i = 2; i < byte_cnt - 4; i = i + 1) begin
-                                    crc_calc = calc_crc32(crc_calc, rx_data_reg[i]);
+                                // 使用固定上限循环，避免综合器无法确定迭代次数
+                                for (i = 2; i < MAX_DATA_LEN; i = i + 1) begin
+                                    if (i < byte_cnt - 4) begin
+                                        crc_calc = calc_crc32(crc_calc, rx_data_reg[i]);
+                                    end
                                 end
                                 crc_calc = ~crc_calc;
                                 rx_crc_ok_o = (crc_calc == rx_crc_received);
                             end else begin
-                                $display("[RX CRC Debug] byte_cnt=%0d < 8, skipping CRC check", byte_cnt);
+                                // byte_cnt < 4, 跳过 CRC 检查
                             end
                             rx_state <= ST_DONE;
                         end else begin
@@ -378,17 +397,14 @@ always @(posedge clk or negedge rst_n) begin
             end
             
             ST_DONE: begin
-                // 清除错误标志
                 rx_error_o <= 1'b0;
-                // 如果 rx_en 被禁用，返回 IDLE
                 if (!rx_en_i) begin
                     rx_done_o <= 1'b0;
                     rx_state <= ST_IDLE;
                 end
-                // 保持 rx_done_o 置位，直到检测到新的边沿（下一包开始）
-                else if (any_edge) begin
+                else if (bmc_rx_synced && !any_edge) begin
                     rx_done_o <= 1'b0;
-                    rx_state <= ST_PREAMBLE;
+                    rx_state <= ST_IDLE;
                 end
             end
             
