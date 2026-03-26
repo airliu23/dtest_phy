@@ -30,14 +30,15 @@ parameter BIT_PERIOD_CNT  = 166;    // 50MHz 对应 300kbps 位周期
 parameter HALF_BIT_CNT    = 83;
 parameter PREAMBLE_LEN    = 64;     // 前导码长度 64bit
 parameter MAX_DATA_LEN    = 30;     // 最大数据字节数 30
-parameter LOW_PERIOD_CNT  = 200;    // 【新增】EOP后低电平保持的时钟周期数 (可调整)
+parameter LOW_PERIOD_CNT  = 400;    // 【新增】EOP后低电平保持的时钟周期数 (可调整)
+parameter BUS_TIMEOUT_CNT = 100000; // 总线空闲超时: 2ms @ 50MHz
 
 // 4B5B K码定义 (完全匹配PD规范)
 localparam KCODE_SYNC1  = 5'b11000;
 localparam KCODE_SYNC2  = 5'b10001;
 localparam KCODE_EOP    = 5'b01101;
 
-// 发送状态机定义 (新增低电平保持状态)
+// 发送状态机定义
 localparam ST_IDLE      = 4'd0;  // 空闲
 localparam ST_PREAMBLE  = 4'd1;  // 发送前导码
 localparam ST_SOP       = 4'd2;  // 发送SOP有序集
@@ -45,8 +46,10 @@ localparam ST_HEADER    = 4'd3;  // 发送2字节Header
 localparam ST_DATA      = 4'd4;  // 发送数据载荷
 localparam ST_CRC       = 4'd5;  // 发送32bit CRC
 localparam ST_EOP       = 4'd6;  // 发送EOP结束符
-localparam ST_LOW       = 4'd7;  // 【新增】EOP后低电平保持
-localparam ST_DONE      = 4'd8;  // 发送完成
+localparam ST_EOP_EDGE  = 4'd7;  // EOP后翻转边沿（如果是0再翻转一次）
+localparam ST_LOW       = 4'd8;  // 拉低保持延时
+localparam ST_HIGH      = 4'd9;  // 拉高保持一个bit周期
+localparam ST_DONE      = 4'd10; // 发送完成
 
 //============================================================================
 // 内部信号
@@ -75,6 +78,7 @@ reg [1:0]  crc_byte_cnt;      // CRC字节计数器(0-3，4字节足够)
 
 // 【新增】低电平保持计数器
 reg [15:0] low_period_cnt;
+reg [16:0] bus_timeout_cnt; // 总线空闲超时计数器
 
 // CRC32计算相关 (PD规范CRC32，多项式0x04C11DB7)
 reg [31:0] crc_reg;
@@ -174,6 +178,7 @@ always @(posedge clk or negedge rst_n) begin
         byte_nibble_sel <= 1'b0;
         crc_byte_cnt <= 2'd0;
         low_period_cnt <= 16'd0;
+        bus_timeout_cnt <= 17'd0;
         crc_reg <= 32'hFFFFFFFF;
         final_crc_reg <= 32'h0;
         
@@ -186,6 +191,24 @@ always @(posedge clk or negedge rst_n) begin
         tx_data_byte1 <= 8'd0;
     end else begin
         tx_done_o <= 1'b0;
+        
+        // 总线空闲超时检测: 任意时刻总线 idle 2ms 回到默认状态
+        // 对于 TX，如果在发送过程中 bit_tick 长时间不触发，说明卡住了
+        if (tx_state != ST_IDLE && tx_state != ST_DONE) begin
+            if (bit_tick) begin
+                bus_timeout_cnt <= 17'd0;
+            end else if (bus_timeout_cnt >= BUS_TIMEOUT_CNT - 1) begin
+                // 超时，回到 IDLE
+                bus_timeout_cnt <= 17'd0;
+                tx_busy_o <= 1'b0;
+                tx_active_o <= 1'b0;
+                tx_state <= ST_IDLE;
+            end else begin
+                bus_timeout_cnt <= bus_timeout_cnt + 1'b1;
+            end
+        end else begin
+            bus_timeout_cnt <= 17'd0;
+        end
         
         case (tx_state)
             ST_IDLE: begin
@@ -374,16 +397,32 @@ always @(posedge clk or negedge rst_n) begin
                     current_symbol <= {1'b0, current_symbol[4:1]};
                     
                     if (symbol_bit_cnt == 3'd4) begin
+                        // EOP 5个bit发送完成
                         symbol_bit_cnt <= 3'd0;
                         low_period_cnt <= 16'd0;
-                        tx_state <= ST_LOW;
+                        if (bmc_state == 1'b0) begin
+                            // bmc_state=0，需要翻转变成1
+                            tx_state <= ST_EOP_EDGE;
+                        end else begin
+                            // bmc_state=1，直接进入拉低状态
+                            tx_state <= ST_LOW;
+                        end
                     end
+                end
+            end
+            
+            ST_EOP_EDGE: begin
+                // bmc_state从0翻转到1，持续1个bit周期
+                if (bit_tick) begin
+                    tx_state <= ST_LOW;
                 end
             end
 
             ST_LOW: begin
                 low_period_cnt <= low_period_cnt + 1'b1;
                 if (low_period_cnt == LOW_PERIOD_CNT - 1) begin
+                    // 拉低延时结束，进入拉高状态
+                    low_period_cnt <= 16'd0;
                     tx_state <= ST_DONE;
                 end
             end
@@ -417,7 +456,12 @@ always @(posedge clk or negedge rst_n) begin
         // 空闲和完成状态：保持高电平，复位 bmc_state
         bmc_state  <= 1'b1;
         bmc_tx_pad <= 1'b1;
+    end else if (tx_state == ST_EOP_EDGE) begin
+        // bmc_state=0时进入此状态，翻转到1
+        bmc_state  <= 1'b1;
+        bmc_tx_pad <= 1'b1;
     end else if (tx_state == ST_LOW) begin
+        // 拉低保持
         bmc_state  <= 1'b0;
         bmc_tx_pad <= 1'b0;
     end else begin

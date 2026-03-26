@@ -51,7 +51,7 @@ localparam [15:0] GOODCRC_HEADER_BASE = 16'h0001;  // Type=GoodCRC (0x01)
 
 // 超时参数 (基于 50MHz 时钟)
 localparam ACK_TIMEOUT_CNT = 2500000;  // 50ms 超时等待 ACK (50MHz * 0.05s)
-localparam GOODCRC_DELAY_CNT = 5000;   // 100μs 延时后发送 GoodCRC (50MHz * 0.0001s)
+localparam GOODCRC_DELAY_CNT = 2250;   // 45μs 延时后发送 GoodCRC (50MHz * 0.000045s)
 
 //============================================================================
 // 内部信号
@@ -115,11 +115,11 @@ wire         final_tx_start;
 //============================================================================
 // TX/RX 互斥逻辑 (考虑自动 ACK 发送)
 //============================================================================
-// TX 可以启动的条件：RX 未忙，且不在发送 ACK 过程中
-wire tx_can_start = tx_start_i && !int_rx_busy && (rx_state != RX_ST_SEND_ACK) && !ack_tx_busy;
+// TX 可以启动的条件：不在发送 ACK 过程中，底层 TX 空闲
+wire tx_can_start = tx_start_i && !int_tx_busy && (rx_state != RX_ST_SEND_ACK) && !ack_tx_busy;
 
-// RX 使能的条件：外部使能 && TX 未忙
-wire rx_actual_en = rx_en_i && !int_tx_busy && !ack_tx_busy;
+// RX 使能的条件：外部使能 && TX 未忙 && 用户未请求发送
+wire rx_actual_en = rx_en_i && !int_tx_busy && !ack_tx_busy && !tx_start_i;
 
 //============================================================================
 // 半双工逻辑：TX/RX 分离输入输出

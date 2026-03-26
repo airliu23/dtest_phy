@@ -41,6 +41,8 @@ parameter BIT_PERIOD_CNT  = 166;
 parameter HALF_BIT_CNT    = 83;
 parameter PREAMBLE_LEN    = 64;
 parameter MAX_DATA_LEN    = 30;
+parameter IDLE_WAIT_CNT   = 2500;   // EOP后等待总线空闲时间: 50us @ 50MHz
+parameter BUS_TIMEOUT_CNT = 100000; // 总线空闲超时: 2ms @ 50MHz
 
 // 4B5B K码定义
 localparam KCODE_SYNC1  = 5'b11000;
@@ -183,6 +185,8 @@ end
 // 接收状态机
 //============================================================================
 reg [3:0]  rx_state;
+reg [15:0] idle_wait_cnt;  // EOP后等待总线空闲计数器
+reg [16:0] bus_timeout_cnt; // 总线空闲超时计数器
 
 // 位计数器
 reg [5:0]  preamble_cnt;
@@ -283,6 +287,8 @@ always @(posedge clk or negedge rst_n) begin
         current_symbol <= 5'd0;
         current_byte <= 8'd0;
         rx_header_reg <= 16'd0;
+        idle_wait_cnt <= 16'd0;
+        bus_timeout_cnt <= 17'd0;
         
         // 复位内部数组 rx_data_reg
         for (i = 0; i < 30; i = i + 1) begin
@@ -295,6 +301,23 @@ always @(posedge clk or negedge rst_n) begin
     end else begin
         rx_done_o <= 1'b0;
         dbg_byte_valid_o <= 1'b0;  // 默认清除调试有效标志
+        
+        // 总线空闲超时检测: 任意时刻总线 idle 2ms 回到默认状态
+        if (rx_state != ST_IDLE) begin
+            if (any_edge) begin
+                bus_timeout_cnt <= 17'd0;
+            end else if (bus_timeout_cnt >= BUS_TIMEOUT_CNT - 1) begin
+                // 超时，回到 IDLE
+                bus_timeout_cnt <= 17'd0;
+                rx_busy_o <= 1'b0;
+                rx_error_o <= 1'b1;  // 标记超时错误
+                rx_state <= ST_IDLE;
+            end else begin
+                bus_timeout_cnt <= bus_timeout_cnt + 1'b1;
+            end
+        end else begin
+            bus_timeout_cnt <= 17'd0;
+        end
         
         case (rx_state)
             ST_IDLE: begin
@@ -347,8 +370,9 @@ always @(posedge clk or negedge rst_n) begin
                         // 检查是否是 EOP KCODE
                         if (current_symbol == KCODE_EOP) begin
                             // 数据结构: SOP(2字节) + Header(2字节) + Data(N字节) + CRC(4字节)
-                            rx_data_len_o <= (byte_cnt > 8) ? (byte_cnt - 8) : 0;
-                            rx_done_o <= 1'b1;
+                            // rx_data_len_o = Header(2) + Data(N) = byte_cnt - SOP(2) - CRC(4)
+                            rx_data_len_o <= (byte_cnt > 6) ? (byte_cnt - 6) : 0;
+                            // 不立即设置 rx_done_o，等待 ST_DONE 状态 200us idle 后再触发
                             rx_busy_o <= 1'b0;
                             
                             if (byte_cnt >= 4) begin
@@ -368,6 +392,7 @@ always @(posedge clk or negedge rst_n) begin
                             end else begin
                                 // byte_cnt < 4, 跳过 CRC 检查
                             end
+                            idle_wait_cnt <= 16'd0;  // 初始化等待计数器
                             rx_state <= ST_DONE;
                         end else begin
                             if (!byte_nibble_sel) begin
@@ -399,12 +424,29 @@ always @(posedge clk or negedge rst_n) begin
             ST_DONE: begin
                 rx_error_o <= 1'b0;
                 if (!rx_en_i) begin
-                    rx_done_o <= 1'b0;
+                    // RX 被禁用，直接回到 IDLE，不触发 rx_done
+                    idle_wait_cnt <= 16'd0;
                     rx_state <= ST_IDLE;
                 end
-                else if (bmc_rx_synced && !any_edge) begin
-                    rx_done_o <= 1'b0;
+                // 检测到下降沿（新消息开始），触发 rx_done 并回到 IDLE 准备接收
+                else if (prev_bmc_val && !bmc_rx_synced) begin
+                    rx_done_o <= 1'b1;  // 触发 rx_done 表示前一条消息接收完成
+                    idle_wait_cnt <= 16'd0;
                     rx_state <= ST_IDLE;
+                end
+                // 总线稳定在高电平时计数，等待确认消息结束
+                else if (bmc_rx_synced && !any_edge) begin
+                    if (idle_wait_cnt >= IDLE_WAIT_CNT - 1) begin
+                        // 等待完成，触发 rx_done_o，回到 IDLE
+                        rx_done_o <= 1'b1;
+                        idle_wait_cnt <= 16'd0;
+                        rx_state <= ST_IDLE;
+                    end else begin
+                        idle_wait_cnt <= idle_wait_cnt + 1'b1;
+                    end
+                end else begin
+                    // 总线有边沿但不是下降沿，重置计数器
+                    idle_wait_cnt <= 16'd0;
                 end
             end
             

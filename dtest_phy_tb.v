@@ -480,20 +480,20 @@ initial begin
     $display("[步骤 4] 检查发送状态...");
     
     // 读取模块 A 状态
-    i2c_read_reg_a(8'h06);  // IRQ_FLAG
+    //i2c_read_reg_a(8'h06);  // IRQ_FLAG
     $display("  模块 A IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b, RX_SUCCESS=%b)", 
              i2c_rd_data_a, i2c_rd_data_a[0], i2c_rd_data_a[1], i2c_rd_data_a[2]);
     
-    i2c_read_reg_a(8'h01);  // STATUS (读清除)
+    //i2c_read_reg_a(8'h01);  // STATUS (读清除)
     $display("  模块 A STATUS = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b, RX_SUCCESS=%b)", 
              i2c_rd_data_a, i2c_rd_data_a[0], i2c_rd_data_a[1], i2c_rd_data_a[2]);
     
     // 读取模块 B 状态
-    i2c_read_reg_b(8'h06);  // IRQ_FLAG
+    //i2c_read_reg_b(8'h06);  // IRQ_FLAG
     $display("  模块 B IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b, RX_SUCCESS=%b)", 
              i2c_rd_data_b, i2c_rd_data_b[0], i2c_rd_data_b[1], i2c_rd_data_b[2]);
     
-    i2c_read_reg_b(8'h01);  // STATUS (读清除)
+    //i2c_read_reg_b(8'h01);  // STATUS (读清除)
     $display("  模块 B STATUS = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b, RX_SUCCESS=%b)", 
              i2c_rd_data_b, i2c_rd_data_b[0], i2c_rd_data_b[1], i2c_rd_data_b[2]);
     
@@ -521,7 +521,7 @@ initial begin
     $display("[步骤 6] 第二次发送测试...");
     
     // 清除中断标志
-    i2c_write_reg_a(8'h06, 8'hFF);
+    //i2c_write_reg_a(8'h06, 8'hFF);
     i2c_write_reg_b(8'h06, 8'hFF);
     
     // 改变 MsgID 为 2
