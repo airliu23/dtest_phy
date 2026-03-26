@@ -14,8 +14,33 @@ VVP = vvp
 # 波形查看器
 GTKWAVE = gtkwave
 
+# Vivado 配置
+XILINX_PATH = /home/airliu/tools/xilinx/2025.2
+VIVADO = $(XILINX_PATH)/Vivado/bin/vivado
+VIVADO_MODE = -mode batch
+VIVADO_OPTS = -nojournal -nolog
+
 # 综合工具 (可选，需要安装 Yosys)
 # YOSYS = yosys
+
+# ----------------------------------------------------------------------------
+# 项目配置
+# ----------------------------------------------------------------------------
+# 项目名称
+PROJECT_NAME = dtest_phy
+
+# FPGA 器件
+FPGA_PART = xc7k325tffg676-2
+
+# 顶层模块
+TOP_MODULE = dtest_phy_top
+
+# 约束文件
+XDC_FILE = xc7k325t_constraints.xdc
+
+# Vivado 输出目录
+VIVADO_OUT_DIR = vivado_out
+VIVADO_PROJECT = $(VIVADO_OUT_DIR)/$(PROJECT_NAME).xpr
 
 # ----------------------------------------------------------------------------
 # 文件配置
@@ -167,6 +192,70 @@ clean:
 .PHONY: distclean
 distclean: clean
 	rm -f *.vcd.* *.log
+	rm -rf $(VIVADO_OUT_DIR)
+
+# ----------------------------------------------------------------------------
+# Vivado 目标
+# ----------------------------------------------------------------------------
+
+# 创建 Vivado 项目
+.PHONY: vivado-project
+vivado-project:
+	@echo "========================================"
+	@echo "创建 Vivado 项目..."
+	@echo "========================================"
+	@mkdir -p $(VIVADO_OUT_DIR)
+	$(VIVADO) $(VIVADO_MODE) $(VIVADO_OPTS) -source tcl/create_project.tcl
+
+# Vivado 综合
+.PHONY: vivado-synth
+vivado-synth:
+	@echo "========================================"
+	@echo "Vivado 综合..."
+	@echo "========================================"
+	@mkdir -p $(VIVADO_OUT_DIR)
+	$(VIVADO) $(VIVADO_MODE) $(VIVADO_OPTS) -source tcl/synth.tcl
+
+# Vivado 实现 (布局布线)
+.PHONY: vivado-impl
+vivado-impl:
+	@echo "========================================"
+	@echo "Vivado 实现..."
+	@echo "========================================"
+	$(VIVADO) $(VIVADO_MODE) $(VIVADO_OPTS) -source tcl/impl.tcl
+
+# 生成 Bitstream
+.PHONY: vivado-bit bitstream
+vivado-bit: bitstream
+bitstream:
+	@echo "========================================"
+	@echo "生成 Bitstream..."
+	@echo "========================================"
+	$(VIVADO) $(VIVADO_MODE) $(VIVADO_OPTS) -source tcl/bitstream.tcl
+
+# Vivado 完整流程 (综合 + 实现 + Bitstream)
+.PHONY: vivado-all vivado
+vivado-all: vivado
+vivado:
+	@echo "========================================"
+	@echo "Vivado 完整编译流程..."
+	@echo "========================================"
+	@mkdir -p $(VIVADO_OUT_DIR)
+	$(VIVADO) $(VIVADO_MODE) $(VIVADO_OPTS) -source tcl/build_all.tcl
+
+# 打开 Vivado GUI
+.PHONY: vivado-gui
+vivado-gui:
+	@echo "打开 Vivado GUI..."
+	$(VIVADO) -mode gui $(VIVADO_PROJECT) &
+
+# 清理 Vivado 输出
+.PHONY: vivado-clean
+vivado-clean:
+	@echo "清理 Vivado 输出..."
+	rm -rf $(VIVADO_OUT_DIR)
+	rm -f *.jou *.log
+	rm -rf .Xil
 
 # ----------------------------------------------------------------------------
 # 综合目标 (需要安装 Yosys)
@@ -214,7 +303,7 @@ help:
 	@echo "USB PD BMC 收发器 - Makefile 帮助"
 	@echo "========================================"
 	@echo ""
-	@echo "主要目标:"
+	@echo "仿真目标:"
 	@echo "  all         - 编译并运行仿真 (默认)"
 	@echo "  pd-phy-test - 运行 PD PHY CC/VBUS 模块测试"
 	@echo "  ab-test     - 运行 A->B 通信测试"
@@ -222,24 +311,30 @@ help:
 	@echo "  simulate    - 运行仿真（需要先编译）"
 	@echo "  rebuild     - 重新编译"
 	@echo "  wave        - 打开 GTKWave 查看波形"
-	@echo "  clean       - 清理生成的文件"
 	@echo "  lint        - 语法检查"
-	@echo "  help        - 显示此帮助信息"
 	@echo ""
-	@echo "高级目标 (需要 Yosys):"
-	@echo "  synth       - RTL 综合"
-	@echo "  rtlil       - 生成 RTLIL 格式"
+	@echo "Vivado 目标:"
+	@echo "  vivado        - 完整编译流程 (综合+实现+Bitstream)"
+	@echo "  vivado-synth  - 仅综合"
+	@echo "  vivado-impl   - 仅实现 (布局布线)"
+	@echo "  bitstream     - 生成 Bitstream"
+	@echo "  vivado-gui    - 打开 Vivado GUI"
+	@echo "  vivado-clean  - 清理 Vivado 输出"
+	@echo ""
+	@echo "清理目标:"
+	@echo "  clean       - 清理仿真文件"
+	@echo "  distclean   - 深度清理 (包括 Vivado 输出)"
 	@echo ""
 	@echo "变量:"
-	@echo "  SIM_OUTPUT = $(SIM_OUTPUT)"
-	@echo "  WAVEFORM   = $(WAVEFORM)"
+	@echo "  FPGA_PART   = $(FPGA_PART)"
+	@echo "  TOP_MODULE  = $(TOP_MODULE)"
+	@echo "  XDC_FILE    = $(XDC_FILE)"
 	@echo ""
 	@echo "示例用法:"
 	@echo "  make                    # 编译并运行仿真"
-	@echo "  make pd-phy-test        # 运行 PD PHY CC/VBUS 测试"
-	@echo "  make ab-test            # 运行 A->B 通信测试"
+	@echo "  make vivado             # Vivado 完整编译"
+	@echo "  make vivado-synth       # 仅运行综合"
 	@echo "  make wave               # 打开波形查看器"
-	@echo "  make DEFINES=-PCLK_FREQ_MHZ=100  # 使用不同时钟频率编译"
 	@echo ""
 
 # ----------------------------------------------------------------------------

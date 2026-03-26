@@ -44,8 +44,11 @@ pd_bmc_debug_sim
 vivado*.jou
 vivado*.log
 Xil/
+vivado_out/
 *.wdb
 *.pb
+clockInfo.txt
+tight_setup_hold_pins.txt
 
 # Quartus
 output_files/
