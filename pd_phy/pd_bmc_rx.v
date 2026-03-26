@@ -12,6 +12,10 @@ module pd_bmc_rx (
     // 接收使能
     input  wire               rx_en_i,
     
+    // SOP 类型过滤
+    input  wire [2:0]         sop_type_i,       // 期望接收的 SOP 类型 (7=接收所有类型)
+    output reg  [2:0]         rx_sop_type_o,    // 实际接收到的 SOP 类型
+    
     // 接收完成包接口
     output reg  [15:0]        rx_header_o,
     output wire [239:0]       rx_data_flat_o,
@@ -45,15 +49,29 @@ parameter IDLE_WAIT_CNT   = 2500;   // EOP后等待总线空闲时间: 50us @ 50
 parameter BUS_TIMEOUT_CNT = 100000; // 总线空闲超时: 2ms @ 50MHz
 
 // 4B5B K码定义
-localparam KCODE_SYNC1  = 5'b11000;
-localparam KCODE_SYNC2  = 5'b10001;
-localparam KCODE_EOP    = 5'b01101;
+localparam KCODE_SYNC1  = 5'b11000;  // Sync-1
+localparam KCODE_SYNC2  = 5'b10001;  // Sync-2
+localparam KCODE_SYNC3  = 5'b00110;  // Sync-3
+localparam KCODE_RST1   = 5'b00111;  // RST-1
+localparam KCODE_RST2   = 5'b11001;  // RST-2
+localparam KCODE_EOP    = 5'b01101;  // EOP
 
-// 接收状态机 (极简版)
+// SOP 类型定义
+localparam SOP_TYPE_SOP         = 3'd0;  // SOP: Sync-1, Sync-1, Sync-1, Sync-2
+localparam SOP_TYPE_SOP_PRIME   = 3'd1;  // SOP': Sync-1, Sync-1, Sync-3, Sync-3
+localparam SOP_TYPE_SOP_DPRIME  = 3'd2;  // SOP'': Sync-1, Sync-3, Sync-1, Sync-3
+localparam SOP_TYPE_SOP_PDBG    = 3'd3;  // SOP'_Debug: Sync-1, RST-2, RST-2, Sync-3
+localparam SOP_TYPE_SOP_DPDBG   = 3'd4;  // SOP''_Debug: Sync-1, RST-2, Sync-3, Sync-2
+localparam SOP_TYPE_CABLE_RESET = 3'd5;  // Cable Reset: RST-1, Sync-1, RST-1, Sync-3
+localparam SOP_TYPE_HARD_RESET  = 3'd6;  // Hard Reset: RST-1, RST-1, RST-1, RST-2
+localparam SOP_TYPE_ANY         = 3'd7;  // 接收任意 SOP 类型
+
+// 接收状态机
 localparam ST_IDLE      = 4'd0;
 localparam ST_PREAMBLE  = 4'd1;
-localparam ST_RECEIVE   = 4'd2;  // SOP + Header + Data + CRC），直到EOP
-localparam ST_DONE      = 4'd3;
+localparam ST_SOP       = 4'd2;  // 接收并识别 SOP 有序集
+localparam ST_RECEIVE   = 4'd3;  // Header + Data + CRC，直到EOP
+localparam ST_DONE      = 4'd4;
 
 //============================================================================
 // 边沿检测参数
@@ -193,6 +211,7 @@ reg [5:0]  preamble_cnt;
 reg [2:0]  symbol_bit_cnt;
 reg [4:0]  byte_cnt;
 reg        byte_nibble_sel;
+reg [1:0]  sop_symbol_cnt;   // SOP 符号计数器 (0-3)
 
 // 数据寄存器
 reg [4:0]  current_symbol;
@@ -201,18 +220,54 @@ reg [15:0] rx_header_reg;
 reg [31:0] crc_calc;         // 用于实时计算接收数据的 CRC
 reg [31:0] rx_crc_received;  // 接收到的 CRC 值
 
+// SOP 符号缓存 (4 个 5-bit 符号)
+reg [4:0]  sop_symbols [0:3];
+
 // 【修复1】声明内部数据数组，用于暂存接收数据
 reg [7:0]  rx_data_reg [0:29];
 
 //============================================================================
+// SOP 类型识别函数
+//============================================================================
+function [2:0] identify_sop_type;
+    input [4:0] sym0, sym1, sym2, sym3;
+    begin
+        // SOP: Sync-1, Sync-1, Sync-1, Sync-2
+        if (sym0 == KCODE_SYNC1 && sym1 == KCODE_SYNC1 && sym2 == KCODE_SYNC1 && sym3 == KCODE_SYNC2)
+            identify_sop_type = SOP_TYPE_SOP;
+        // SOP': Sync-1, Sync-1, Sync-3, Sync-3
+        else if (sym0 == KCODE_SYNC1 && sym1 == KCODE_SYNC1 && sym2 == KCODE_SYNC3 && sym3 == KCODE_SYNC3)
+            identify_sop_type = SOP_TYPE_SOP_PRIME;
+        // SOP'': Sync-1, Sync-3, Sync-1, Sync-3
+        else if (sym0 == KCODE_SYNC1 && sym1 == KCODE_SYNC3 && sym2 == KCODE_SYNC1 && sym3 == KCODE_SYNC3)
+            identify_sop_type = SOP_TYPE_SOP_DPRIME;
+        // SOP'_Debug: Sync-1, RST-2, RST-2, Sync-3
+        else if (sym0 == KCODE_SYNC1 && sym1 == KCODE_RST2 && sym2 == KCODE_RST2 && sym3 == KCODE_SYNC3)
+            identify_sop_type = SOP_TYPE_SOP_PDBG;
+        // SOP''_Debug: Sync-1, RST-2, Sync-3, Sync-2
+        else if (sym0 == KCODE_SYNC1 && sym1 == KCODE_RST2 && sym2 == KCODE_SYNC3 && sym3 == KCODE_SYNC2)
+            identify_sop_type = SOP_TYPE_SOP_DPDBG;
+        // Cable Reset: RST-1, Sync-1, RST-1, Sync-3
+        else if (sym0 == KCODE_RST1 && sym1 == KCODE_SYNC1 && sym2 == KCODE_RST1 && sym3 == KCODE_SYNC3)
+            identify_sop_type = SOP_TYPE_CABLE_RESET;
+        // Hard Reset: RST-1, RST-1, RST-1, RST-2
+        else if (sym0 == KCODE_RST1 && sym1 == KCODE_RST1 && sym2 == KCODE_RST1 && sym3 == KCODE_RST2)
+            identify_sop_type = SOP_TYPE_HARD_RESET;
+        else
+            identify_sop_type = SOP_TYPE_ANY;  // 无效 SOP，使用 7 表示
+    end
+endfunction
+
+//============================================================================
 // 数据输出映射
-// rx_data_reg 布局: [0-1]:SOP, [2-3]:Header, [4...]:Data, [最后4字节]:CRC
-// rx_data_flat_o 输出实际数据部分 (从 rx_data_reg[4] 开始)
+// rx_data_reg 布局: [0-1]:Header, [2...]:Data, [最后4字节]:CRC
+// (SOP 由 ST_SOP 状态单独处理，不存入 rx_data_reg)
+// rx_data_flat_o 输出实际数据部分 (从 rx_data_reg[2] 开始)
 //============================================================================
 genvar k;
 generate
     for (k = 0; k < 26; k = k + 1) begin : gen_rx_data_map
-        assign rx_data_flat_o[k*8 +: 8] = rx_data_reg[k + 4];
+        assign rx_data_flat_o[k*8 +: 8] = rx_data_reg[k + 2];
     end
     // 填充剩余位为 0
     for (k = 26; k < 30; k = k + 1) begin : gen_rx_data_pad
@@ -280,8 +335,10 @@ always @(posedge clk or negedge rst_n) begin
         rx_error_o <= 1'b0;
         rx_header_o <= 16'd0;
         rx_data_len_o <= 5'd0;
+        rx_sop_type_o <= 3'd0;
         preamble_cnt <= 6'd0;
         symbol_bit_cnt <= 3'd0;
+        sop_symbol_cnt <= 2'd0;
         byte_cnt <= 5'd0;
         byte_nibble_sel <= 1'b0;
         current_symbol <= 5'd0;
@@ -289,6 +346,11 @@ always @(posedge clk or negedge rst_n) begin
         rx_header_reg <= 16'd0;
         idle_wait_cnt <= 16'd0;
         bus_timeout_cnt <= 17'd0;
+        
+        // 复位 SOP 符号缓存
+        for (i = 0; i < 4; i = i + 1) begin
+            sop_symbols[i] <= 5'd0;
+        end
         
         // 复位内部数组 rx_data_reg
         for (i = 0; i < 30; i = i + 1) begin
@@ -326,6 +388,7 @@ always @(posedge clk or negedge rst_n) begin
                 rx_crc_ok_o <= 1'b0;
                 preamble_cnt <= 6'd0;
                 symbol_bit_cnt <= 3'd0;
+                sop_symbol_cnt <= 2'd0;
                 crc_calc <= 32'hFFFFFFFF;
                 // 添加更完整的状态清除
                 byte_cnt <= 5'd0;
@@ -349,40 +412,94 @@ always @(posedge clk or negedge rst_n) begin
                 else if (rx_bit_valid) begin
                     preamble_cnt <= preamble_cnt + 1'b1;
                     
-                    if (preamble_cnt == PREAMBLE_LEN - 1) begin
+                    if (preamble_cnt == PREAMBLE_LEN - 2) begin
                         byte_cnt <= 5'd0;
                         byte_nibble_sel <= 1'b0;
                         symbol_bit_cnt <= 3'd0;
+                        sop_symbol_cnt <= 2'd0;
                         current_symbol <= 5'd0;
-                        rx_state <= ST_RECEIVE;
+                        rx_state <= ST_SOP;
                     end
                 end
             end
             
-            // 接收所有数据（SOP + Header + Data + CRC），直到检测到 EOP
-            ST_RECEIVE: begin
+            // 接收 SOP 有序集 (4 个 K 码符号)
+            ST_SOP: begin
                 if (rx_bit_valid) begin
                     symbol_bit_cnt <= symbol_bit_cnt + 1'b1;
+                    // 右移，新位插入 MSB
                     current_symbol <= {rx_bit, current_symbol[4:1]};
                     
                     if (symbol_bit_cnt == 3'd4) begin
                         symbol_bit_cnt <= 3'd0;
+                        // 保存当前 SOP 符号 (使用完整的新符号值，包含第5位)
+                        sop_symbols[sop_symbol_cnt] <= {rx_bit, current_symbol[4:1]};
+                        sop_symbol_cnt <= sop_symbol_cnt + 1'b1;
+                        
+                        if (sop_symbol_cnt == 2'd3) begin
+                            // 所有 4 个 SOP 符号接收完成，识别 SOP 类型
+                            // 注意: sop_symbols[3] 尚未更新，使用即时计算值
+                            rx_sop_type_o <= identify_sop_type(sop_symbols[0], sop_symbols[1], sop_symbols[2], {rx_bit, current_symbol[4:1]});
+                            
+                            // 检查是否匹配期望的 SOP 类型
+                            if (sop_type_i == SOP_TYPE_ANY || 
+                                sop_type_i == identify_sop_type(sop_symbols[0], sop_symbols[1], sop_symbols[2], {rx_bit, current_symbol[4:1]})) begin
+                                
+                                // HARD_RESET 和 CABLE_RESET 没有 Header/Data/CRC/EOP
+                                if (identify_sop_type(sop_symbols[0], sop_symbols[1], sop_symbols[2], {rx_bit, current_symbol[4:1]}) == SOP_TYPE_HARD_RESET ||
+                                    identify_sop_type(sop_symbols[0], sop_symbols[1], sop_symbols[2], {rx_bit, current_symbol[4:1]}) == SOP_TYPE_CABLE_RESET) begin
+                                    // 直接完成，设置默认值
+                                    rx_header_o <= 16'h0000;
+                                    rx_data_len_o <= 5'd0;
+                                    rx_crc_ok_o <= 1'b1;  // Reset 消息无 CRC，视为有效
+                                    rx_done_o <= 1'b1;
+                                    rx_state <= ST_DONE;
+                                end else begin
+                                    // SOP 匹配，继续接收数据
+                                    byte_cnt <= 5'd0;
+                                    byte_nibble_sel <= 1'b0;
+                                    current_symbol <= 5'd0;
+                                    rx_state <= ST_RECEIVE;
+                                end
+                            end else begin
+                                // SOP 不匹配，丢弃消息
+                                rx_busy_o <= 1'b0;
+                                rx_state <= ST_IDLE;
+                            end
+                        end
+                    end
+                end
+            end
+            
+            // 接收 Header + Data + CRC，直到检测到 EOP
+            ST_RECEIVE: begin
+                if (rx_bit_valid) begin
+                    symbol_bit_cnt <= symbol_bit_cnt + 1'b1;
+                    // 右移，新位插入 MSB
+                    current_symbol <= {rx_bit, current_symbol[4:1]};
+                    
+                    if (symbol_bit_cnt == 3'd4) begin
+                        symbol_bit_cnt <= 3'd0;
+                        // 使用完整的 5-bit 符号 (包含刚接收的第5位)
+                        // 注意: current_symbol 是非阻塞赋值的旧值，需要手动计算新值
                         // 检查是否是 EOP KCODE
-                        if (current_symbol == KCODE_EOP) begin
-                            // 数据结构: SOP(2字节) + Header(2字节) + Data(N字节) + CRC(4字节)
-                            // rx_data_len_o = Header(2) + Data(N) = byte_cnt - SOP(2) - CRC(4)
-                            rx_data_len_o <= (byte_cnt > 6) ? (byte_cnt - 6) : 0;
+                        if ({rx_bit, current_symbol[4:1]} == KCODE_EOP) begin
+                            // 数据结构: Header(2字节) + Data(N字节) + CRC(4字节)
+                            // (SOP 已由 ST_SOP 单独处理)
+                            // rx_data_len_o = Header(2) + Data(N) = byte_cnt - CRC(4)
+                            rx_data_len_o <= (byte_cnt > 4) ? (byte_cnt - 4) : 0;
                             // 不立即设置 rx_done_o，等待 ST_DONE 状态 200us idle 后再触发
                             rx_busy_o <= 1'b0;
                             
                             if (byte_cnt >= 4) begin
-                                // 提取 Header (SOP后的前2字节, 即 rx_data_reg[2-3])
-                                rx_header_o <= {rx_data_reg[3], rx_data_reg[2]};
-                                // rx_msg_id_o <= rx_data_reg[2][6:4];  // MessageID 在 Header 低字节 [14:12]
+                                // 提取 Header (前2字节, 即 rx_data_reg[0-1])
+                                rx_header_o <= {rx_data_reg[1], rx_data_reg[0]};
+                                // rx_msg_id_o <= rx_data_reg[0][6:4];  // MessageID 在 Header 低字节 [14:12]
                                 
                                 rx_crc_received = {rx_data_reg[byte_cnt - 1],rx_data_reg[byte_cnt - 2],rx_data_reg[byte_cnt - 3],rx_data_reg[byte_cnt - 4]};
                                 // 使用固定上限循环，避免综合器无法确定迭代次数
-                                for (i = 2; i < MAX_DATA_LEN; i = i + 1) begin
+                                // CRC 计算从 Header 开始 (index 0)
+                                for (i = 0; i < MAX_DATA_LEN; i = i + 1) begin
                                     if (i < byte_cnt - 4) begin
                                         crc_calc = calc_crc32(crc_calc, rx_data_reg[i]);
                                     end
@@ -396,15 +513,15 @@ always @(posedge clk or negedge rst_n) begin
                             rx_state <= ST_DONE;
                         end else begin
                             if (!byte_nibble_sel) begin
-                                current_byte[3:0] = decode_4b5b_data(current_symbol);
+                                current_byte[3:0] = decode_4b5b_data({rx_bit, current_symbol[4:1]});
                             end else begin
-                                current_byte[7:4] = decode_4b5b_data(current_symbol);
+                                current_byte[7:4] = decode_4b5b_data({rx_bit, current_symbol[4:1]});
                                 // 保存到内部数组 rx_data_reg
-                                rx_data_reg[byte_cnt] <= {decode_4b5b_data(current_symbol), current_byte[3:0]};
+                                rx_data_reg[byte_cnt] <= {decode_4b5b_data({rx_bit, current_symbol[4:1]}), current_byte[3:0]};
                                 
                                 // 调试输出 - 高字节时输出完整byte
                                 if (dbg_en_i) begin
-                                    dbg_byte_o <= {decode_4b5b_data(current_symbol), current_byte[3:0]};
+                                    dbg_byte_o <= {decode_4b5b_data({rx_bit, current_symbol[4:1]}), current_byte[3:0]};
                                     dbg_byte_valid_o <= 1'b1;
                                 end
                                 

@@ -1,6 +1,9 @@
 //============================================================================
 // dtest_phy I2C 控制测试平台
-// 测试: A 发送消息，B 接收并自动回复 GoodCRC
+// 测试: SOP 类型过滤功能
+// - B 模块 RX 只接收 SOP 消息
+// - A 模块依次发送 SOP' -> HARD_RESET -> SOP
+// - 验证 B 只接收最后的 SOP 消息
 //============================================================================
 
 `timescale 1ns/1ps
@@ -129,6 +132,8 @@ pd_bmc_rx u_bmc_monitor (
     .clk            (clk_50m),
     .rst_n          (rst_n),
     .rx_en_i        (1'b1),
+    .sop_type_i     (3'd7),      // 接收所有 SOP 类型
+    .rx_sop_type_o  (),          // 不使用
     .rx_header_o    (mon_rx_header),
     .rx_data_flat_o (mon_rx_data),
     .rx_data_len_o  (mon_rx_data_len),
@@ -164,8 +169,8 @@ always @(posedge clk_50m or negedge rst_n) begin
             $display("[Monitor] Frame #%0d: Header=0x%04h, MsgType=%0d, MsgID=%0d, CRC_OK=%b",
                      frame_cnt, mon_rx_header, mon_rx_header[4:0], mon_rx_header[11:9], mon_rx_crc_ok);
             
-            // 检测 GoodCRC (MessageType = 0x01)
-            if (mon_rx_header[4:0] == 5'b00001) begin
+            // 检测 GoodCRC (MessageType = 0x01 且 NumDataObj = 0)
+            if (mon_rx_header[4:0] == 5'b00001 && mon_rx_header[14:12] == 3'b000) begin
                 goodcrc_msg_cnt <= goodcrc_msg_cnt + 1'b1;
                 if (mon_rx_crc_ok) begin
                     goodcrc_cnt <= goodcrc_cnt + 1'b1;
@@ -397,7 +402,14 @@ end
 //============================================================================
 // 主测试流程
 //============================================================================
+// SOP 类型定义 (与 pd_bmc_tx.v 保持一致)
+localparam [2:0] SOP_TYPE_SOP       = 3'd0;  // SOP
+localparam [2:0] SOP_TYPE_SOP_PRIME = 3'd1;  // SOP'
+localparam [2:0] SOP_TYPE_CABLE_RST = 3'd5;  // CABLE RESET
+localparam [2:0] SOP_TYPE_HARD_RST  = 3'd6;  // HARD RESET
+
 integer test_pass, test_fail;
+integer sop_prime_goodcrc_cnt, hard_rst_goodcrc_cnt, sop_goodcrc_cnt;
 
 initial begin
     rst_n         = 1'b0;
@@ -410,7 +422,8 @@ initial begin
     
     $display("");
     $display("========================================");
-    $display("  dtest_phy I2C GoodCRC 测试");
+    $display("  SOP 类型过滤功能测试");
+    $display("  B 只接收 SOP，A 依次发 SOP'/HARD_RST/SOP");
     $display("========================================");
     
     #200;
@@ -419,170 +432,292 @@ initial begin
     $display("[%0t] 复位完成", $time);
     
     //------------------------------------------------------------------
-    // 步骤 1: 配置模块 B (接收端) - 启用 RX (自动回复 GoodCRC)
+    // 步骤 1: 配置模块 B - RX 只接收 SOP 消息
     //------------------------------------------------------------------
     $display("");
-    $display("[步骤 1] 配置模块 B (接收端)...");
+    $display("[步骤 1] 配置模块 B - RX 只接收 SOP 消息...");
     
-    // 清除中断标志 (0x06)
-    i2c_write_reg_b(8'h06, 8'hFF);
-    // CTRL (0x00): RX_EN=1 => bit1=1 => 0x02 (启用 RX 就会自动回复 GoodCRC)
-    i2c_write_reg_b(8'h00, 8'h02);
+    // 清除中断标志
+    i2c_write_reg_b(8'h10, 8'hFF);
     
-    i2c_read_reg_b(8'h00);
-    $display("  模块 B CTRL = 0x%02h (RX_EN=%b)", i2c_rd_data_b, i2c_rd_data_b[1]);
+    // 配置 RX_SOP_EN (0x2F): 只使能 SOP (bit0=1)
+    i2c_write_reg_b(8'h2F, 8'h01);  // 只接收 SOP
+    
+    // 通过 RX_SOP_EN (0x2F) 配置已完成
+    
+    i2c_read_reg_b(8'h2F);
+    $display("  模块 B RX_SOP_EN = 0x%02h (只接收 SOP)", i2c_rd_data_b);
+    i2c_read_reg_b(8'h50);
+    $display("  模块 B TX_FRAME_TYPE = 0x%02h (RX_EN=%b)", i2c_rd_data_b, i2c_rd_data_b[4]);
     
     #10000;
     
     //------------------------------------------------------------------
-    // 步骤 2: 配置模块 A (发送端) - 发送消息
+    // 步骤 2: 配置模块 A 发送端基本参数
     //------------------------------------------------------------------
     $display("");
-    $display("[步骤 2] 配置模块 A (发送端)...");
+    $display("[步骤 2] 配置模块 A 发送 Source_Cap (20字节)...");
     
     // 清除中断标志
-    i2c_write_reg_a(8'h06, 8'hFF);
-    // 启用 RX (接收 GoodCRC 回复)
-    i2c_write_reg_a(8'h00, 8'h02);
+    i2c_write_reg_a(8'h10, 8'hFF);
+    // 启用 RX 接收 GoodCRC 回复
+    i2c_write_reg_a(8'h2F, 8'h01);  // RX_SOP_EN=0x01 (只收SOP)
     
-    // 配置 Header (0x02=TX_HDR_L, 0x03=TX_HDR_H)
-    // Header: 0x0261 (MsgID=1, SpecRev=01, Type=Accept=0x03)
-    // USB PD MessageType: 0x03=Accept (不是 GoodCRC)
-    i2c_write_reg_a(8'h02, 8'hA3);  // TX_HDR_L: MessageType=0x03(Accept), DataRole=0, SpecRev=01
-    i2c_write_reg_a(8'h03, 8'h03);  // TX_HDR_H: MsgID=1
+    // 配置 Header: 0x51A1 (NumDataObj=5, MsgID=0, SourceCap)
+    i2c_write_reg_a(8'h52, 8'hA1);  // TX_HDR_L
+    i2c_write_reg_a(8'h53, 8'h51);  // TX_HDR_H
+    i2c_write_reg_a(8'h51, 8'h14);  // TX_LEN=20
     
-    // 配置数据长度 (0x04=TX_LEN) - 无数据
-    i2c_write_reg_a(8'h04, 8'h00);
+    // 写入 5个 PDO (从截图中的实际数据)
+    // PDO[0]: 0x0a01912c - Fixed 5V 3A
+    i2c_write_reg_a(8'h54, 8'h2c); i2c_write_reg_a(8'h55, 8'h91);
+    i2c_write_reg_a(8'h56, 8'h01); i2c_write_reg_a(8'h57, 8'h0a);
+    // PDO[1]: 0x0002d12c - Fixed 9V 3A
+    i2c_write_reg_a(8'h58, 8'h2c); i2c_write_reg_a(8'h59, 8'hd1);
+    i2c_write_reg_a(8'h5A, 8'h02); i2c_write_reg_a(8'h5B, 8'h00);
+    // PDO[2]: 0x0003c12c - Fixed 12V 3A
+    i2c_write_reg_a(8'h5C, 8'h2c); i2c_write_reg_a(8'h5D, 8'hc1);
+    i2c_write_reg_a(8'h5E, 8'h03); i2c_write_reg_a(8'h5F, 8'h00);
+    // PDO[3]: 0x0004b12c - Fixed 15V 3A
+    i2c_write_reg_a(8'h60, 8'h2c); i2c_write_reg_a(8'h61, 8'hb1);
+    i2c_write_reg_a(8'h62, 8'h04); i2c_write_reg_a(8'h63, 8'h00);
+    // PDO[4]: 0x000641f4 - Fixed 20V 5A
+    i2c_write_reg_a(8'h64, 8'hf4); i2c_write_reg_a(8'h65, 8'h41);
+    i2c_write_reg_a(8'h66, 8'h06); i2c_write_reg_a(8'h67, 8'h00);
     
-    // 启用中断 (0x05=IRQ_EN): TX_DONE_IE=1, TX_FAIL_IE=1
-    i2c_write_reg_a(8'h05, 8'h03);
-    
-    $display("  Header: 0x03A3 (MsgID=1, Type=Accept)");
+    // 启用中断
+    i2c_write_reg_a(8'h12, 8'h54);
     
     //------------------------------------------------------------------
-    // 步骤 3: 启动发送
+    // 步骤 3: A 发送 SOP' 消息 (B 应该忽略)
     //------------------------------------------------------------------
     $display("");
-    $display("[步骤 3] 启动模块 A 发送...");
+    $display("[步骤 3] A 发送 SOP' 消息 (B 应忽略)...");
     
-    // CTRL (0x00): TX_START=1 => bit0=1 => 0x01
-    // 同时启用 RX 接收 GoodCRC: TX_START=1, RX_EN=1 => 0x03
-    i2c_write_reg_a(8'h00, 8'h03);
+    sop_prime_goodcrc_cnt = goodcrc_cnt;
     
-    // 等待发送和 GoodCRC 回复
-    $display("  等待发送完成和 GoodCRC 回复...");
+    // TX_FRAME_TYPE: [2:0]=001(SOP'), [3]=1(TX_START), [4]=1(RX_EN) = 0x19
+    i2c_write_reg_a(8'h50, 8'h19);
+    
+    $display("  等待发送...");
     #2000000;  // 2ms
     
-    //------------------------------------------------------------------
-    // 步骤 4: 检查结果
-    //------------------------------------------------------------------
-    $display("");
-    $display("[步骤 4] 检查发送状态...");
+    // 检查 A 的状态 - 应该是 TX_FAIL (没收到 GoodCRC)
+    i2c_read_reg_a(8'h10);
+    $display("  模块 A IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b)", 
+             i2c_rd_data_a, i2c_rd_data_a[6], i2c_rd_data_a[4]);
     
-    // 读取模块 A 状态
-    //i2c_read_reg_a(8'h06);  // IRQ_FLAG
-    $display("  模块 A IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b, RX_SUCCESS=%b)", 
-             i2c_rd_data_a, i2c_rd_data_a[0], i2c_rd_data_a[1], i2c_rd_data_a[2]);
-    
-    //i2c_read_reg_a(8'h01);  // STATUS (读清除)
-    $display("  模块 A STATUS = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b, RX_SUCCESS=%b)", 
-             i2c_rd_data_a, i2c_rd_data_a[0], i2c_rd_data_a[1], i2c_rd_data_a[2]);
-    
-    // 读取模块 B 状态
-    //i2c_read_reg_b(8'h06);  // IRQ_FLAG
-    $display("  模块 B IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b, RX_SUCCESS=%b)", 
-             i2c_rd_data_b, i2c_rd_data_b[0], i2c_rd_data_b[1], i2c_rd_data_b[2]);
-    
-    //i2c_read_reg_b(8'h01);  // STATUS (读清除)
-    $display("  模块 B STATUS = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b, RX_SUCCESS=%b)", 
-             i2c_rd_data_b, i2c_rd_data_b[0], i2c_rd_data_b[1], i2c_rd_data_b[2]);
-    
-    //------------------------------------------------------------------
-    // 步骤 5: 验证 GoodCRC
-    //------------------------------------------------------------------
-    $display("");
-    $display("[步骤 5] 验证 GoodCRC 回复...");
-    $display("  BMC 总线上检测到的 GoodCRC 消息数量: %0d", goodcrc_msg_cnt);
-    $display("  其中 CRC 正确的 GoodCRC 数量: %0d", goodcrc_cnt);
-    
-    // 只要检测到 GoodCRC 消息就算成功（即使 CRC 校验失败）
-    if (goodcrc_msg_cnt >= 1) begin
-        $display("  GoodCRC 回复: PASS (检测到 GoodCRC 消息)");
+    // 验证没有新的 GoodCRC
+    if (goodcrc_cnt == sop_prime_goodcrc_cnt) begin
+        $display("  SOP' 测试: PASS (B 正确忽略了 SOP' 消息)");
         test_pass = test_pass + 1;
     end else begin
-        $display("  GoodCRC 回复: FAIL (未检测到 GoodCRC 消息)");
+        $display("  SOP' 测试: FAIL (B 不应该响应 SOP' 消息)");
         test_fail = test_fail + 1;
     end
     
+    // 清除中断
+    i2c_write_reg_a(8'h10, 8'hFF);
+    
     //------------------------------------------------------------------
-    // 步骤 6: 第二次发送测试
+    // 步骤 4: A 发送 HARD_RESET 消息 (B 应该忽略)
     //------------------------------------------------------------------
     $display("");
-    $display("[步骤 6] 第二次发送测试...");
+    $display("[步骤 4] A 发送 HARD_RESET 消息 (B 应忽略)...");
     
-    // 清除中断标志
-    //i2c_write_reg_a(8'h06, 8'hFF);
-    i2c_write_reg_b(8'h06, 8'hFF);
+    hard_rst_goodcrc_cnt = goodcrc_cnt;
     
-    // 改变 MsgID 为 2
-    i2c_write_reg_a(8'h03, 8'h04);  // TX_HDR_H: MsgID=2
-    $display("  Header: 0x04A3 (MsgID=2, Type=Accept)");
+    // 更新 Header: NumDataObj=5, MsgID=2
+    i2c_write_reg_a(8'h53, 8'h54);
     
-    // 启动第二次发送
-    i2c_write_reg_a(8'h00, 8'h03);  // TX_START=1, RX_EN=1
-    $display("  等待第二次发送...");
+    // TX_FRAME_TYPE: [2:0]=110(HARD_RST), [3]=1(TX_START), [4]=1(RX_EN) = 0x1E
+    i2c_write_reg_a(8'h50, 8'h1E);
+    
+    $display("  等待发送...");
     #2000000;  // 2ms
     
-    // 检查结果
-    i2c_read_reg_a(8'h06);  // IRQ_FLAG
+    // 检查 A 的状态 - 应该是 TX_FAIL (HARD_RESET 不需要 GoodCRC)
+    i2c_read_reg_a(8'h10);
     $display("  模块 A IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b)", 
-             i2c_rd_data_a, i2c_rd_data_a[0], i2c_rd_data_a[1]);
+             i2c_rd_data_a, i2c_rd_data_a[6], i2c_rd_data_a[4]);
     
-    i2c_read_reg_a(8'h01);  // STATUS
-    $display("  模块 A STATUS = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b)", 
-             i2c_rd_data_a, i2c_rd_data_a[0], i2c_rd_data_a[1]);
-    
-    if (i2c_rd_data_a[0]) begin
-        $display("  第二次发送: PASS");
+    // 验证没有新的 GoodCRC (HARD_RESET 不会有 GoodCRC 响应)
+    if (goodcrc_cnt == hard_rst_goodcrc_cnt) begin
+        $display("  HARD_RESET 测试: PASS (B 正确忽略了 HARD_RESET)");
         test_pass = test_pass + 1;
     end else begin
-        $display("  第二次发送: FAIL");
+        $display("  HARD_RESET 测试: FAIL (B 不应该响应 HARD_RESET)");
         test_fail = test_fail + 1;
     end
     
+    // 清除中断
+    i2c_write_reg_a(8'h10, 8'hFF);
+    i2c_write_reg_b(8'h10, 8'hFF);
+    
     //------------------------------------------------------------------
-    // 步骤 7: 第三次发送测试
+    // 步骤 5: A 发送 SOP 消息 (B 应该接收并回复 GoodCRC)
     //------------------------------------------------------------------
     $display("");
-    $display("[步骤 7] 第三次发送测试...");
+    $display("[步骤 5] A 发送 SOP 消息 (B 应接收并回复 GoodCRC)...");
     
-    // 清除中断标志
-    i2c_write_reg_a(8'h06, 8'hFF);
-    i2c_write_reg_b(8'h06, 8'hFF);
+    sop_goodcrc_cnt = goodcrc_cnt;
     
-    // 改变 MsgID 为 3
-    i2c_write_reg_a(8'h03, 8'h06);  // TX_HDR_H: MsgID=3
-    $display("  Header: 0x06A3 (MsgID=3, Type=Accept)");
+    // 更新 Header: NumDataObj=5, MsgID=3
+    i2c_write_reg_a(8'h53, 8'h56);  // TX_HDR_H
     
-    // 启动第三次发送
-    i2c_write_reg_a(8'h00, 8'h03);  // TX_START=1, RX_EN=1
-    $display("  等待第三次发送...");
+    // TX_FRAME_TYPE: [2:0]=000(SOP), [3]=1(TX_START), [4]=1(RX_EN) = 0x18
+    i2c_write_reg_a(8'h50, 8'h18);
+    
+    $display("  等待发送...");
     #2000000;  // 2ms
     
-    // 检查结果
-    i2c_read_reg_a(8'h06);  // IRQ_FLAG
+    // 检查 A 的状态 - 应该是 TX_SUCCESS (收到 GoodCRC)
+    i2c_read_reg_a(8'h10);
     $display("  模块 A IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b)", 
-             i2c_rd_data_a, i2c_rd_data_a[0], i2c_rd_data_a[1]);
+             i2c_rd_data_a, i2c_rd_data_a[6], i2c_rd_data_a[4]);
     
-    i2c_read_reg_a(8'h01);  // STATUS
-    $display("  模块 A STATUS = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b)", 
-             i2c_rd_data_a, i2c_rd_data_a[0], i2c_rd_data_a[1]);
+    // 检查 B 的状态 - 应该有 RX_SUCCESS
+    i2c_read_reg_b(8'h10);
+    $display("  模块 B IRQ_FLAG = 0x%02h (RX_SUCCESS=%b)", 
+             i2c_rd_data_b, i2c_rd_data_b[2]);
     
-    if (i2c_rd_data_a[0]) begin
-        $display("  第三次发送: PASS");
+    // 验证收到 GoodCRC
+    if (goodcrc_cnt > sop_goodcrc_cnt && i2c_rd_data_a[6]) begin
+        $display("  SOP 测试: PASS (B 正确接收并回复 GoodCRC)");
         test_pass = test_pass + 1;
     end else begin
-        $display("  第三次发送: FAIL");
+        $display("  SOP 测试: FAIL (B 应该响应 SOP 消息)");
+        test_fail = test_fail + 1;
+    end
+    
+    //==================================================================
+    // 第二阶段: B 模块打开所有消息接收
+    //==================================================================
+    $display("");
+    $display("========================================");
+    $display("  第二阶段: B 接收所有消息类型测试");
+    $display("========================================");
+    
+    //------------------------------------------------------------------
+    // 步骤 6: 配置 B 模块接收所有消息类型
+    //------------------------------------------------------------------
+    $display("");
+    $display("[步骤 6] 配置模块 B 接收所有消息类型...");
+    
+    // 清除中断标志
+    i2c_write_reg_a(8'h10, 8'hFF);
+    i2c_write_reg_b(8'h10, 8'hFF);
+    
+    // 配置 RX_SOP_EN (0x2F): 使能所有类型
+    i2c_write_reg_b(8'h2F, 8'hFF);
+    
+    i2c_read_reg_b(8'h2F);
+    $display("  模块 B RX_SOP_EN = 0x%02h (接收所有类型)", i2c_rd_data_b);
+    
+    #10000;
+    
+    //------------------------------------------------------------------
+    // 步骤 7: A 发送 SOP' 消息 (B 应该接收)
+    //------------------------------------------------------------------
+    $display("");
+    $display("[步骤 7] A 发送 SOP' 消息 (B 应接收)...");
+    
+    sop_prime_goodcrc_cnt = goodcrc_cnt;
+    
+    // 更新 Header: NumDataObj=5, MsgID=4
+    i2c_write_reg_a(8'h53, 8'h58);
+    
+    // TX_FRAME_TYPE: [2:0]=001(SOP'), [3]=1(TX_START), [4]=1(RX_EN) = 0x19
+    i2c_write_reg_a(8'h50, 8'h19);
+    
+    $display("  等待发送...");
+    #2000000;  // 2ms
+    
+    i2c_read_reg_a(8'h10);
+    $display("  模块 A IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b)", 
+             i2c_rd_data_a, i2c_rd_data_a[6], i2c_rd_data_a[4]);
+    
+    i2c_read_reg_b(8'h10);
+    $display("  模块 B IRQ_FLAG = 0x%02h (RX_SUCCESS=%b)", 
+             i2c_rd_data_b, i2c_rd_data_b[2]);
+    
+    // 验证 B 收到并回复 GoodCRC
+    if (goodcrc_cnt > sop_prime_goodcrc_cnt && i2c_rd_data_a[6]) begin
+        $display("  SOP' 接收测试: PASS (B 正确接收并回复 GoodCRC)");
+        test_pass = test_pass + 1;
+    end else begin
+        $display("  SOP' 接收测试: FAIL");
+        test_fail = test_fail + 1;
+    end
+    
+    // 清除中断
+    i2c_write_reg_a(8'h10, 8'hFF);
+    i2c_write_reg_b(8'h10, 8'hFF);
+    
+    //------------------------------------------------------------------
+    // 步骤 8: A 发送 HARD_RESET 消息 (B 应该接收)
+    //------------------------------------------------------------------
+    $display("");
+    $display("[步骤 8] A 发送 HARD_RESET 消息 (B 应接收)...");
+    
+    // TX_FRAME_TYPE: [2:0]=110(HARD_RST), [3]=1(TX_START), [4]=1(RX_EN) = 0x1E
+    i2c_write_reg_a(8'h50, 8'h1E);
+    
+    $display("  等待发送...");
+    #500000;  // 0.5ms (HARD_RESET 很快完成)
+    
+    i2c_read_reg_a(8'h10);
+    $display("  模块 A IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b)", 
+             i2c_rd_data_a, i2c_rd_data_a[6], i2c_rd_data_a[4]);
+    
+    i2c_read_reg_b(8'h10);
+    $display("  模块 B IRQ_FLAG = 0x%02h (HARD_RST=%b, RX_SUCCESS=%b)", 
+             i2c_rd_data_b, i2c_rd_data_b[3], i2c_rd_data_b[2]);
+    
+    // 验证 B 收到 HARD_RESET (IRQ_FLAG bit3 置位)
+    if (i2c_rd_data_b[3]) begin
+        $display("  HARD_RESET 接收测试: PASS (B 正确检测到 HARD_RESET)");
+        test_pass = test_pass + 1;
+    end else begin
+        $display("  HARD_RESET 接收测试: FAIL");
+        test_fail = test_fail + 1;
+    end
+    
+    // 清除中断
+    i2c_write_reg_a(8'h10, 8'hFF);
+    i2c_write_reg_b(8'h10, 8'hFF);
+    
+    //------------------------------------------------------------------
+    // 步骤 9: A 发送 SOP 消息 (B 应该接收)
+    //------------------------------------------------------------------
+    $display("");
+    $display("[步骤 9] A 发送 SOP 消息 (B 应接收)...");
+    
+    sop_goodcrc_cnt = goodcrc_cnt;
+    
+    // 更新 Header: NumDataObj=5, MsgID=5
+    i2c_write_reg_a(8'h53, 8'h5A);
+    
+    // TX_FRAME_TYPE: [2:0]=000(SOP), [3]=1(TX_START), [4]=1(RX_EN) = 0x18
+    i2c_write_reg_a(8'h50, 8'h18);
+    
+    $display("  等待发送...");
+    #2000000;  // 2ms
+    
+    i2c_read_reg_a(8'h10);
+    $display("  模块 A IRQ_FLAG = 0x%02h (TX_SUCCESS=%b, TX_FAIL=%b)", 
+             i2c_rd_data_a, i2c_rd_data_a[6], i2c_rd_data_a[4]);
+    
+    i2c_read_reg_b(8'h10);
+    $display("  模块 B IRQ_FLAG = 0x%02h (RX_SUCCESS=%b)", 
+             i2c_rd_data_b, i2c_rd_data_b[2]);
+    
+    // 验证 B 收到并回复 GoodCRC
+    if (goodcrc_cnt > sop_goodcrc_cnt && i2c_rd_data_a[6]) begin
+        $display("  SOP 接收测试: PASS (B 正确接收并回复 GoodCRC)");
+        test_pass = test_pass + 1;
+    end else begin
+        $display("  SOP 接收测试: FAIL");
         test_fail = test_fail + 1;
     end
     
@@ -591,6 +726,7 @@ initial begin
     //------------------------------------------------------------------
     $display("");
     $display("========================================");
+    $display("  BMC 总线上检测到的 GoodCRC 数量: %0d", goodcrc_cnt);
     $display("  结果: %0d PASS, %0d FAIL", test_pass, test_fail);
     if (test_fail == 0)
         $display("  状态: ALL TESTS PASSED");

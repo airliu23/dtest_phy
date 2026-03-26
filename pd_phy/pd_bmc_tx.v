@@ -8,6 +8,7 @@ module pd_bmc_tx (
     input  wire               clk,
     input  wire               rst_n,
     
+    input  wire [2:0]         sop_type_i,       // SOP类型: 0=SOP, 1=SOP', 2=SOP'', 3=SOP'_Debug, 4=SOP''_Debug
     input  wire [15:0]        tx_header_i,
     input  wire [239:0]       tx_data_flat_i, // 30x8bit 展平为 240bit
     input  wire [4:0]         tx_data_len_i,
@@ -34,9 +35,21 @@ parameter LOW_PERIOD_CNT  = 400;    // 【新增】EOP后低电平保持的时�
 parameter BUS_TIMEOUT_CNT = 100000; // 总线空闲超时: 2ms @ 50MHz
 
 // 4B5B K码定义 (完全匹配PD规范)
-localparam KCODE_SYNC1  = 5'b11000;
-localparam KCODE_SYNC2  = 5'b10001;
-localparam KCODE_EOP    = 5'b01101;
+localparam KCODE_SYNC1  = 5'b11000;  // Sync-1
+localparam KCODE_SYNC2  = 5'b10001;  // Sync-2
+localparam KCODE_SYNC3  = 5'b00110;  // Sync-3
+localparam KCODE_RST1   = 5'b00111;  // RST-1
+localparam KCODE_RST2   = 5'b11001;  // RST-2
+localparam KCODE_EOP    = 5'b01101;  // EOP
+
+// SOP 类型定义
+localparam SOP_TYPE_SOP         = 3'd0;  // SOP: Sync-1, Sync-1, Sync-1, Sync-2
+localparam SOP_TYPE_SOP_PRIME   = 3'd1;  // SOP': Sync-1, Sync-1, Sync-3, Sync-3
+localparam SOP_TYPE_SOP_DPRIME  = 3'd2;  // SOP'': Sync-1, Sync-3, Sync-1, Sync-3
+localparam SOP_TYPE_SOP_PDBG    = 3'd3;  // SOP'_Debug: Sync-1, RST-2, RST-2, Sync-3
+localparam SOP_TYPE_SOP_DPDBG   = 3'd4;  // SOP''_Debug: Sync-1, RST-2, Sync-3, Sync-2
+localparam CABLE_RESET          = 3'd5;  // CABLE_RESET: RST-1, Sync-1, RST-1, Sync-3
+localparam HARD_RESET           = 3'd6;  // HARD_RESET: RST-1, RST-1, RST-1, RST-2
 
 // 发送状态机定义
 localparam ST_IDLE      = 4'd0;  // 空闲
@@ -89,9 +102,86 @@ reg [15:0] tx_header_reg;
 // 添加内部数据数组
 reg [7:0]  tx_data_reg [0:29];
 reg [4:0]  tx_data_len_reg;
+reg [2:0]  sop_type_reg;  // 保存 SOP 类型
 
 reg [7:0]  tx_data_byte0;
 reg [7:0]  tx_data_byte1;
+
+//============================================================================
+// 根据 SOP 类型获取对应的 K 码符号
+//============================================================================
+function [4:0] get_sop_symbol;
+    input [2:0] sop_type;
+    input [1:0] symbol_idx;  // 0-3: 四个 SOP 符号
+    begin
+        case (sop_type)
+            SOP_TYPE_SOP: begin  // SOP: Sync-1, Sync-1, Sync-1, Sync-2
+                case (symbol_idx)
+                    2'd0: get_sop_symbol = KCODE_SYNC1;
+                    2'd1: get_sop_symbol = KCODE_SYNC1;
+                    2'd2: get_sop_symbol = KCODE_SYNC1;
+                    2'd3: get_sop_symbol = KCODE_SYNC2;
+                endcase
+            end
+            SOP_TYPE_SOP_PRIME: begin  // SOP': Sync-1, Sync-1, Sync-3, Sync-3
+                case (symbol_idx)
+                    2'd0: get_sop_symbol = KCODE_SYNC1;
+                    2'd1: get_sop_symbol = KCODE_SYNC1;
+                    2'd2: get_sop_symbol = KCODE_SYNC3;
+                    2'd3: get_sop_symbol = KCODE_SYNC3;
+                endcase
+            end
+            SOP_TYPE_SOP_DPRIME: begin  // SOP'': Sync-1, Sync-3, Sync-1, Sync-3
+                case (symbol_idx)
+                    2'd0: get_sop_symbol = KCODE_SYNC1;
+                    2'd1: get_sop_symbol = KCODE_SYNC3;
+                    2'd2: get_sop_symbol = KCODE_SYNC1;
+                    2'd3: get_sop_symbol = KCODE_SYNC3;
+                endcase
+            end
+            SOP_TYPE_SOP_PDBG: begin  // SOP'_Debug: Sync-1, RST-2, RST-2, Sync-3
+                case (symbol_idx)
+                    2'd0: get_sop_symbol = KCODE_SYNC1;
+                    2'd1: get_sop_symbol = KCODE_RST2;
+                    2'd2: get_sop_symbol = KCODE_RST2;
+                    2'd3: get_sop_symbol = KCODE_SYNC3;
+                endcase
+            end
+            SOP_TYPE_SOP_DPDBG: begin  // SOP''_Debug: Sync-1, RST-2, Sync-3, Sync-2
+                case (symbol_idx)
+                    2'd0: get_sop_symbol = KCODE_SYNC1;
+                    2'd1: get_sop_symbol = KCODE_RST2;
+                    2'd2: get_sop_symbol = KCODE_SYNC3;
+                    2'd3: get_sop_symbol = KCODE_SYNC2;
+                endcase
+            end
+            CABLE_RESET: begin  // Cable Reset: RST-1, Sync-1, RST-1, Sync-3
+                case (symbol_idx)
+                    2'd0: get_sop_symbol = KCODE_RST1;
+                    2'd1: get_sop_symbol = KCODE_SYNC1;
+                    2'd2: get_sop_symbol = KCODE_RST1;
+                    2'd3: get_sop_symbol = KCODE_SYNC3;
+                endcase
+            end
+            HARD_RESET: begin  // Hard Reset: RST-1, RST-1, RST-1, RST-2
+                case (symbol_idx)
+                    2'd0: get_sop_symbol = KCODE_RST1;
+                    2'd1: get_sop_symbol = KCODE_RST1;
+                    2'd2: get_sop_symbol = KCODE_RST1;
+                    2'd3: get_sop_symbol = KCODE_RST2;
+                endcase
+            end
+            default: begin  // 默认 SOP
+                case (symbol_idx)
+                    2'd0: get_sop_symbol = KCODE_SYNC1;
+                    2'd1: get_sop_symbol = KCODE_SYNC1;
+                    2'd2: get_sop_symbol = KCODE_SYNC1;
+                    2'd3: get_sop_symbol = KCODE_SYNC2;
+                endcase
+            end
+        endcase
+    end
+endfunction
 
 //============================================================================
 // 4B5B 编码函数
@@ -167,6 +257,7 @@ always @(posedge clk or negedge rst_n) begin
         tx_state <= ST_IDLE;
         tx_header_reg <= 16'd0;
         tx_data_len_reg <= 5'd0;
+        sop_type_reg <= 3'd0;
         tx_busy_o <= 1'b0;
         tx_done_o <= 1'b0;
         tx_active_o <= 1'b0;
@@ -220,6 +311,7 @@ always @(posedge clk or negedge rst_n) begin
                     tx_active_o <= 1'b1;
                     tx_header_reg <= tx_header_i;
                     tx_data_len_reg <= tx_data_len_i;
+                    sop_type_reg <= sop_type_i;  // 保存 SOP 类型
                     
                     // 从展平输入加载到内部数组
                     for (i = 0; i < 30; i = i + 1) begin
@@ -245,7 +337,7 @@ always @(posedge clk or negedge rst_n) begin
                 if (bit_tick) begin
                     preamble_cnt <= preamble_cnt + 1'b1;
                     if (preamble_cnt == PREAMBLE_LEN - 1) begin
-                        current_symbol <= KCODE_SYNC1;
+                        current_symbol <= get_sop_symbol(sop_type_reg, 2'd0);  // 第一个 SOP 符号
                         tx_state <= ST_SOP;
                     end
                 end
@@ -261,15 +353,20 @@ always @(posedge clk or negedge rst_n) begin
                         sop_symbol_cnt <= sop_symbol_cnt + 1'b1;
                         
                         case (sop_symbol_cnt)
-                            2'd0: current_symbol <= KCODE_SYNC1;
-                            2'd1: current_symbol <= KCODE_SYNC1;
-                            2'd2: current_symbol <= KCODE_SYNC2;
+                            2'd0: current_symbol <= get_sop_symbol(sop_type_reg, 2'd1);  // 第二个 SOP 符号
+                            2'd1: current_symbol <= get_sop_symbol(sop_type_reg, 2'd2);  // 第三个 SOP 符号
+                            2'd2: current_symbol <= get_sop_symbol(sop_type_reg, 2'd3);  // 第四个 SOP 符号
                             2'd3: begin
-                                current_byte <= tx_header_reg[7:0];
-                                current_symbol <= encode_4b5b_data(tx_header_reg[3:0]);
-                                byte_nibble_sel <= 1'b0;
-                                byte_cnt <= 5'd0;
-                                tx_state <= ST_HEADER;
+                                // HARD_RESET 和 CABLE_RESET 没有 Header/Data/CRC/EOP
+                                if (sop_type_reg == HARD_RESET || sop_type_reg == CABLE_RESET) begin
+                                    tx_state <= ST_DONE;
+                                end else begin
+                                    current_byte <= tx_header_reg[7:0];
+                                    current_symbol <= encode_4b5b_data(tx_header_reg[3:0]);
+                                    byte_nibble_sel <= 1'b0;
+                                    byte_cnt <= 5'd0;
+                                    tx_state <= ST_HEADER;
+                                end
                             end
                         endcase
                     end

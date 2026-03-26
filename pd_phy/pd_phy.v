@@ -39,6 +39,7 @@ module pd_phy (
     // BMC 收发器接口
     //============================================================================
     // TX 接口
+    input  wire [2:0]  tx_sop_type_i,    // TX SOP 类型
     input  wire [15:0] tx_header_i,
     input  wire [239:0] tx_data_flat_i,
     input  wire [4:0]  tx_data_len_i,
@@ -47,10 +48,14 @@ module pd_phy (
     output wire        tx_fail_o,       // 发送失败（超时）
     
     // RX 接口
+    input  wire [2:0]  rx_sop_type_i,   // RX 期望的 SOP 类型 (7=接收所有)
+    input  wire [7:0]  rx_sop_en_mask_i, // RX SOP 类型使能掩码
+    output wire [2:0]  rx_sop_type_o,   // 实际接收到的 SOP 类型
     output wire [15:0] rx_header_o,
     output wire [239:0] rx_data_flat_o,
     output wire [4:0]  rx_data_len_o,
     output wire        rx_success_o,    // 接收成功（回复 GoodCRC 完成）
+    output wire        rx_hard_reset_o, // 收到 HARD_RESET
     input  wire        rx_en_i,         // RX 使能控制
     
     // 配置接口
@@ -112,6 +117,7 @@ pd_bmc_transceiver u_bmc_transceiver (
     .rst_n          (rst_n),
     
     // TX 接口
+    .tx_sop_type_i  (tx_sop_type_i),
     .tx_header_i    (tx_header_i),
     .tx_data_flat_i (tx_data_flat_i),
     .tx_data_len_i  (tx_data_len_i),
@@ -120,10 +126,14 @@ pd_bmc_transceiver u_bmc_transceiver (
     .tx_fail_o      (tx_fail_o),
     
     // RX 接口
+    .rx_sop_type_i  (rx_sop_type_i),
+    .rx_sop_en_mask_i (rx_sop_en_mask_i),
+    .rx_sop_type_o  (rx_sop_type_o),
     .rx_header_o    (rx_header_o),
     .rx_data_flat_o (rx_data_flat_o),
     .rx_data_len_o  (rx_data_len_o),
     .rx_success_o   (rx_success_o),
+    .rx_hard_reset_o(rx_hard_reset_o),
     .rx_en_i        (rx_en_i),
     
     // 配置接口

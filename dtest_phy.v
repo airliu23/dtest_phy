@@ -192,6 +192,7 @@ end
 wire [15:0]  tx_header;
 wire [239:0] tx_data_flat;
 wire [4:0]   tx_data_len;
+wire [2:0]   tx_sop_type;     // TX SOP 类型
 wire         tx_start;
 wire         tx_success;  // 发送成功
 wire         tx_fail;     // 发送失败
@@ -200,7 +201,10 @@ wire [15:0]  rx_header;
 wire [239:0] rx_data_flat;
 wire [4:0]   rx_data_len;
 wire         rx_success;  // 接收成功
+wire         rx_hard_reset; // 收到 HARD_RESET
 wire         rx_en;       // RX 使能控制
+wire [7:0]   rx_sop_en_mask;  // RX SOP 类型使能掩码
+wire [2:0]   rx_sop_type_o;   // 接收到的 SOP 类型
 
 // 协议配置信号
 wire [7:0]   header_good_crc;  // GoodCRC配置 [0]:PowerRole [1]:DataRole [2]:CablePlug [3]:CableRole
@@ -237,6 +241,7 @@ pd_phy_regs u_pd_phy_regs (
     .tx_header    (tx_header),
     .tx_data_flat (tx_data_flat),
     .tx_data_len  (tx_data_len),
+    .tx_sop_type  (tx_sop_type),
     .tx_start     (tx_start),
     .tx_success   (tx_success),
     .tx_fail      (tx_fail),
@@ -244,7 +249,10 @@ pd_phy_regs u_pd_phy_regs (
     .rx_data_flat (rx_data_flat),
     .rx_data_len  (rx_data_len),
     .rx_success   (rx_success),
+    .rx_hard_reset(rx_hard_reset),
+    .rx_sop_type  (rx_sop_type_o),
     .rx_en        (rx_en),
+    .rx_sop_en_mask (rx_sop_en_mask),
     .header_good_crc (header_good_crc),
     // CC 接口
     .cc1_mode     (cc1_mode),
@@ -271,6 +279,10 @@ wire bmc_tx_en_internal; // 内部 TX 使能
 assign bmc_tx = bmc_tx_internal;
 assign bmc_tx_en = bmc_tx_en_internal;
 
+// SOP 类型默认值
+// RX: 接收所有类型 (7)，实际过滤由 rx_sop_en_mask 控制
+localparam [2:0] RX_SOP_TYPE = 3'd7;  // 接收所有类型
+
 pd_phy u_pd_phy (
     .clk            (clk_50m),
     .rst_n          (rst_n),
@@ -291,6 +303,7 @@ pd_phy u_pd_phy (
     .plug_orient_o  (plug_orient_out),
     
     // TX 接口
+    .tx_sop_type_i  (tx_sop_type),
     .tx_header_i    (tx_header),
     .tx_data_flat_i (tx_data_flat),
     .tx_data_len_i  (tx_data_len),
@@ -299,10 +312,14 @@ pd_phy u_pd_phy (
     .tx_fail_o      (tx_fail),
     
     // RX 接口
+    .rx_sop_type_i  (RX_SOP_TYPE),
+    .rx_sop_en_mask_i (rx_sop_en_mask),
+    .rx_sop_type_o  (rx_sop_type_o),
     .rx_header_o    (rx_header),
     .rx_data_flat_o (rx_data_flat),
     .rx_data_len_o  (rx_data_len),
     .rx_success_o   (rx_success),
+    .rx_hard_reset_o(rx_hard_reset),
     .rx_en_i        (rx_en),
     
     // 协议配置

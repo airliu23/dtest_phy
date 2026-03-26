@@ -6,6 +6,7 @@
 // - TX 和 RX 共用同一条 BMC 线（半双工）
 // - RX 接收完成后自动发送 GoodCRC 确认
 // - TX 发送后等待接收 GoodCRC 确认
+// - 支持 SOP 类型选择 (SOP, SOP', SOP'', SOP'_Debug, SOP''_Debug)
 //============================================================================
 
 `timescale 1ns/1ps
@@ -15,6 +16,7 @@ module pd_bmc_transceiver (
     input  wire         rst_n,
     
     // TX 接口
+    input  wire [2:0]   tx_sop_type_i,    // TX SOP 类型
     input  wire [15:0]  tx_header_i,
     input  wire [239:0] tx_data_flat_i,
     input  wire [4:0]   tx_data_len_i,
@@ -23,10 +25,14 @@ module pd_bmc_transceiver (
     output wire         tx_fail_o,        // 发送失败（超时未收到 GoodCRC）
     
     // RX 接口
+    input  wire [2:0]   rx_sop_type_i,    // RX 期望的 SOP 类型 (7=接收所有)
+    input  wire [7:0]   rx_sop_en_mask_i, // RX SOP 类型使能掩码
+    output wire [2:0]   rx_sop_type_o,    // 实际接收到的 SOP 类型
     output wire [15:0]  rx_header_o,
     output wire [239:0] rx_data_flat_o,
     output wire [4:0]   rx_data_len_o,
     output wire         rx_success_o,     // 接收成功（回复 GoodCRC 完成）
+    output reg          rx_hard_reset_o,  // 收到 HARD_RESET
     input  wire         rx_en_i,          // RX 使能控制
     
     // 配置接口
@@ -45,6 +51,10 @@ module pd_bmc_transceiver (
 //============================================================================
 // 参数定义
 //============================================================================
+// SOP 类型定义
+localparam SOP_TYPE_CABLE_RESET = 3'd5;  // Cable Reset
+localparam SOP_TYPE_HARD_RESET  = 3'd6;  // Hard Reset
+
 // GoodCRC 消息定义 (USB PD 规范)
 // Header: [15:12]=Type(0x01=GoodCRC), [11:8]=PortRole, [7:5]=SpecRev, [4:0]=MsgID
 localparam [15:0] GOODCRC_HEADER_BASE = 16'h0001;  // Type=GoodCRC (0x01)
@@ -76,6 +86,7 @@ reg [21:0] ack_timeout_cnt;  // ACK 超时计数器
 reg tx_success_reg;          // 发送成功标志
 reg tx_fail_reg;
 reg goodcrc_received_reg;    // 标记是否已收到 GoodCRC
+reg [2:0] tx_sop_type_reg;   // 保存 TX 的 SOP 类型
 
 // RX 握手状态机
 localparam RX_ST_IDLE           = 3'd0;
@@ -107,10 +118,14 @@ reg         rx_crc_ok_reg;
 wire rx_is_goodcrc;
 
 // 最终 TX 输入 (用户数据或 ACK 数据)
+wire [2:0]   final_tx_sop_type;
 wire [15:0]  final_tx_header;
 wire [239:0] final_tx_data_flat;
 wire [4:0]   final_tx_data_len;
 wire         final_tx_start;
+
+// 保存接收到的 SOP 类型用于 GoodCRC 回复
+reg [2:0]    rx_sop_type_reg;
 
 //============================================================================
 // TX/RX 互斥逻辑 (考虑自动 ACK 发送)
@@ -130,12 +145,17 @@ assign bmc_tx_en = int_tx_busy;
 //============================================================================
 // 检测接收到的消息是否为 GoodCRC (MessageType = 0x01, 在 bit[4:0])
 //============================================================================
-assign rx_is_goodcrc = (rx_header_o[4:0] == 5'b00001);  // GoodCRC MessageType = 0x01
-wire rx_is_goodcrc_reg = (rx_header_reg[4:0] == 5'b00001);  // 使用保存的 header 判断
+// GoodCRC: MsgType=1 且 NumDataObj=0
+assign rx_is_goodcrc = (rx_header_o[4:0] == 5'b00001) && (rx_header_o[14:12] == 3'b000);
+wire rx_is_goodcrc_reg = (rx_header_reg[4:0] == 5'b00001) && (rx_header_reg[14:12] == 3'b000);
+
+// 检查 SOP 类型是否在使能掩码中
+wire rx_sop_type_enabled = rx_sop_en_mask_i[rx_sop_type_o];
 
 //============================================================================
 // TX 输出选择 (用户数据 vs ACK 数据)
 //============================================================================
+assign final_tx_sop_type  = (rx_state == RX_ST_SEND_ACK) ? rx_sop_type_reg : tx_sop_type_i;
 assign final_tx_header    = (rx_state == RX_ST_SEND_ACK) ? ack_header : tx_header_i;
 assign final_tx_data_flat = (rx_state == RX_ST_SEND_ACK) ? ack_data_flat : tx_data_flat_i;
 assign final_tx_data_len  = (rx_state == RX_ST_SEND_ACK) ? ack_data_len : tx_data_len_i;
@@ -152,6 +172,7 @@ always @(posedge clk or negedge rst_n) begin
         tx_success_reg <= 1'b0;
         tx_fail_reg <= 1'b0;
         goodcrc_received_reg <= 1'b0;
+        tx_sop_type_reg <= 3'd0;
     end else begin
         tx_success_reg <= 1'b0;
         tx_fail_reg <= 1'b0;
@@ -169,14 +190,20 @@ always @(posedge clk or negedge rst_n) begin
             TX_ST_IDLE: begin
                 ack_timeout_cnt <= 22'd0;
                 if (tx_start_i && !int_tx_busy && (rx_state != RX_ST_SEND_ACK)) begin
+                    tx_sop_type_reg <= tx_sop_type_i;  // 保存 SOP 类型
                     tx_state <= TX_ST_SENDING;
                 end
             end
             
             TX_ST_SENDING: begin
                 if (raw_tx_done) begin
-                    tx_state <= TX_ST_WAIT_ACK;
-                    ack_timeout_cnt <= 22'd0;
+                    // HARD_RESET 和 CABLE_RESET 不需要 GoodCRC 响应，也不需要 TX_SUCCESS
+                    if (tx_sop_type_reg == SOP_TYPE_HARD_RESET || tx_sop_type_reg == SOP_TYPE_CABLE_RESET) begin
+                        tx_state <= TX_ST_IDLE;  // 直接回到 IDLE，不报告 TX_SUCCESS
+                    end else begin
+                        tx_state <= TX_ST_WAIT_ACK;
+                        ack_timeout_cnt <= 22'd0;
+                    end
                 end
             end
             
@@ -216,10 +243,12 @@ always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         rx_state <= RX_ST_IDLE;
         rx_success_reg <= 1'b0;
+        rx_hard_reset_o <= 1'b0;
         rx_header_reg <= 16'd0;
         rx_data_flat_reg <= 240'd0;
         rx_data_len_reg <= 5'd0;
         rx_crc_ok_reg <= 1'b0;
+        rx_sop_type_reg <= 3'd0;
         ack_header <= 16'd0;
         ack_data_flat <= 240'd0;
         ack_data_len <= 5'd0;
@@ -227,6 +256,7 @@ always @(posedge clk or negedge rst_n) begin
         goodcrc_delay_cnt <= 13'd0;
     end else begin
         rx_success_reg <= 1'b0;
+        rx_hard_reset_o <= 1'b0;  // 默认清零，收到 HARD_RESET 时置位
         // 注意：ack_tx_start 不在此处清除，由各状态单独管理
         
         case (rx_state)
@@ -244,7 +274,20 @@ always @(posedge clk or negedge rst_n) begin
                     rx_data_flat_reg <= rx_data_flat_o;
                     rx_data_len_reg <= rx_data_len_o;
                     rx_crc_ok_reg <= rx_crc_ok_internal;
-                    if (rx_crc_ok_internal && !rx_is_goodcrc) begin
+                    rx_sop_type_reg <= rx_sop_type_o;  // 保存 SOP 类型用于 GoodCRC 回复
+                    
+                    // 检查 SOP 类型是否在使能掩码中
+                    if (!rx_sop_type_enabled) begin
+                        // SOP 类型不匹配，忽略该消息，直接回到 IDLE
+                        rx_state <= RX_ST_DONE;
+                    end else if (rx_sop_type_o == SOP_TYPE_HARD_RESET || rx_sop_type_o == SOP_TYPE_CABLE_RESET) begin
+                        // HARD_RESET 和 CABLE_RESET 不需要 GoodCRC 回复
+                        if (rx_sop_type_o == SOP_TYPE_HARD_RESET) begin
+                            rx_hard_reset_o <= 1'b1;  // 产生 HARD_RESET 中断
+                        end
+                        rx_success_reg <= 1'b1;
+                        rx_state <= RX_ST_DONE;
+                    end else if (rx_crc_ok_internal && !rx_is_goodcrc) begin
                         // CRC 正确且不是 GoodCRC 消息，需要发送 ACK
                         // USB PD Header 格式:
                         // [15]:Extended, [14:12]:NumDataObj, [11:9]:MsgID, [8]:PowerRole
@@ -321,6 +364,7 @@ assign rx_success_o = rx_success_reg;
 pd_bmc_tx u_pd_bmc_tx (
     .clk            (clk),
     .rst_n          (rst_n),
+    .sop_type_i     (final_tx_sop_type),
     .tx_header_i    (final_tx_header),
     .tx_data_flat_i (final_tx_data_flat),
     .tx_data_len_i  (final_tx_data_len),
@@ -346,6 +390,9 @@ wire rx_error_internal;
 pd_bmc_rx u_pd_bmc_rx (
     .clk            (clk),
     .rst_n          (rst_n),
+    .rx_en_i        (rx_actual_en),
+    .sop_type_i     (rx_sop_type_i),
+    .rx_sop_type_o  (rx_sop_type_o),
     .rx_header_o    (rx_header_o),
     .rx_data_flat_o (rx_data_flat_o),
     .rx_data_len_o  (rx_data_len_o),
@@ -355,11 +402,10 @@ pd_bmc_rx u_pd_bmc_rx (
     .rx_crc_ok_o    (rx_crc_ok_internal),
     .rx_msg_id_o    (),
     .bmc_rx_pad     (bmc_rx_pad),
-    .rx_en_i        (rx_actual_en),
     .dbg_en_i       (1'b0),
     .dbg_byte_o     (),
     .dbg_byte_valid_o (),
-    .dbg_toggle_o       (dbg_toggle_o)
+    .dbg_toggle_o   (dbg_toggle_o)
 );
 
 // Transceiver 层 RX 状态调试
